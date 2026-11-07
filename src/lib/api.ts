@@ -218,6 +218,9 @@ export const api = {
   importLegacy: (game: number) => invoke<[number, string[]]>("import_legacy", { game }),
   openFolder: (game: number, which: "content" | "game") => invoke<void>("open_folder", { game, which }),
   openUrl: (url: string) => invoke<void>("open_url", { url }),
+  /** a Nexus page in Mods Manager's own window; its download clicks come back as "nexus-link" */
+  nexusBrowse: (url: string, name?: string, show = false) => invoke<void>("nexus_browse", { url, name: name ?? null, show }),
+  nexusBrowseClose: () => invoke<void>("nexus_browse_close"),
   version: () => invoke<string>("app_version"),
 };
 

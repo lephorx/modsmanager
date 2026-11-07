@@ -276,7 +276,7 @@ function openFolder(which: "content" | "game") {
                   <Crown v-if="nexus.premium" :size="14" style="color: var(--status-orange)" /><CircleCheck v-else :size="14" style="color: var(--status-green)" />
                   <span>
                     <strong>{{ nexus.name }}</strong> ·
-                    {{ nexus.premium ? "Premium: Nexus mods sync on their own." : "Free account: each Nexus mod needs one click on the website per computer. Sync opens the exact file; you click Slow download." }}
+                    {{ nexus.premium ? "Premium: Nexus mods sync on their own." : "Free account: log in once in the Nexus window. Slow downloads then start automatically in the background." }}
                   </span>
                 </p>
               </div>

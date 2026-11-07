@@ -20,7 +20,7 @@ export const store = reactive({
   /** newer files found by "Check for updates", by mod id (for the shown game) */
   updates: {} as Record<string, NewMod>,
   checking: false,
-  /** walking through Nexus files a free account has to click, one page at a time */
+  /** automating free Nexus downloads one page at a time */
   nexusAssist: false,
   /** the queue panel in the top bar */
   queueOpen: false,
@@ -138,6 +138,7 @@ function onQueue(jobs: Job[]) {
   }
   wasActive = active;
   if (store.nexusAssist) followNexus();
+  else if (gameJobs().some((j) => j.status === "waiting" && before.get(j.id) !== "waiting")) followNexus();
 }
 
 export async function checkUpdates(quiet = false) {
@@ -155,7 +156,7 @@ export async function checkUpdates(quiet = false) {
   }
 }
 
-/** Nexus files this computer still has to click on the website (free accounts). */
+/** Nexus files still needing a browser-generated download link. */
 export function nexusPending() {
   const waiting = gameJobs().filter((j) => j.status === "waiting");
   const queuedKeys = new Set(gameJobs().map((j) => j.key));
@@ -163,34 +164,44 @@ export function nexusPending() {
   return [...waiting.map((j) => ({ key: j.key, name: j.name, manualUrl: j.manualUrl })), ...notQueued.map((p) => ({ key: p.key, name: p.name, manualUrl: p.manualUrl }))];
 }
 
-/** The Nexus job whose page is open, waiting for its click. */
+/** The Nexus job currently being prepared in the browser. */
 let assisting: string | null = null;
 
 /** Opens the next Nexus file's page; the click there comes back as an nxm:// link. */
-export async function nextFromNexus() {
+export async function nextFromNexus(show = false) {
   // make sure the Nexus files are in the queue, so their clicks have somewhere to go
   if (nexusPending().some((p) => !gameJobs().some((j) => j.key === p.key))) await runSync(true);
   const next = gameJobs().find((j) => j.status === "waiting" && j.manualUrl);
   if (!next?.manualUrl) {
     if (store.nexusAssist) toast.success("Everything from Nexus is in");
-    store.nexusAssist = false;
-    assisting = null;
+    stopNexus();
     return;
   }
   store.nexusAssist = true;
   assisting = next.key;
-  void api.openUrl(next.manualUrl);
+  try {
+    await api.nexusBrowse(next.manualUrl, next.name, show);
+  } catch (e) {
+    toast.error(errorText(e));
+    stopNexus();
+  }
 }
 
-/** After the clicked file finished, open the next one. */
+/** As soon as the clicked file is queued (its download runs in the background), show the next page. */
+let advancing = false;
 function followNexus() {
+  if (advancing) return;
   const j = gameJobs().find((x) => x.key === assisting);
-  if (!j || j.status === "done" || j.status === "failed") void nextFromNexus();
+  if (j && j.status === "waiting") return;
+  advancing = true;
+  void nextFromNexus().finally(() => (advancing = false));
 }
 
 export function stopNexus() {
+  const was = store.nexusAssist;
   store.nexusAssist = false;
   assisting = null;
+  if (was) void api.nexusBrowseClose().catch(() => {});
 }
 
 const VERBS: Record<string, string> = { add: "added", update: "updated", remove: "removed", import: "imported" };
@@ -200,7 +211,7 @@ export async function startEvents() {
   if (started) return;
   started = true;
   await listen<Job[]>("queue", (e) => onQueue(e.payload));
-  store.queue = await api.queue().catch(() => []);
+  onQueue(await api.queue().catch(() => []));
   await listen<boolean>("live", (e) => (store.live = e.payload));
   // a "Mod Manager Download" click on Nexus: install that file, then open the next one
   await listen<{ modId: string; fileId: string }>("nexus-link", async (e) => {
@@ -211,6 +222,12 @@ export async function startEvents() {
     }
     toast.info(m ? `Got ${m.name} from Nexus, installing…` : "Got a file from Nexus");
   });
+  // the in-app Nexus window was closed: stop walking through the files
+  await listen("nexus-closed", () => {
+    store.nexusAssist = false;
+    assisting = null;
+  });
+  await listen<string>("nexus-error", (e) => toast.error(e.payload));
   await listen<string>("remote-changed", async (e) => {
     let change: { game?: number; actor?: string; action?: string; name?: string } = {};
     try {

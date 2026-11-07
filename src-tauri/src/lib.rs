@@ -334,6 +334,10 @@ fn handle_nxm(app: &AppHandle, link: &str) -> R<()> {
         kick(app);
     }
     let _ = app.emit("nexus-link", serde_json::json!({ "domain": l.domain, "modId": l.mod_id, "fileId": l.file_id }));
+    // clicked in the in-app Nexus window: stay there, it moves on to the next file
+    if app.get_webview_window(NEXUS_WINDOW).is_some() {
+        return Ok(());
+    }
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.unminimize();
         let _ = w.set_focus();
@@ -1224,6 +1228,89 @@ fn open_url(app: AppHandle, url: String) -> R<()> {
     app.opener().open_url(url, None::<&str>).map_err(|e| e.to_string())
 }
 
+const NEXUS_WINDOW: &str = "nexus";
+static NEXUS_TARGET: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Loads a Nexus file in a hidden persistent browser, revealed for login or recovery. The
+/// helper selects "Slow download"; its `nxm://` navigation is caught here instead of
+/// going through the browser and Windows. The window gets no access to the app's commands.
+/// Async on purpose: a window made from a synchronous command on Windows hangs, blank and white.
+#[tauri::command]
+async fn nexus_browse(app: AppHandle, url: String, name: Option<String>, show: Option<bool>) -> R<()> {
+    let parsed: url::Url = url.parse().map_err(|_| "Not a web link")?;
+    if parsed.scheme() != "https" || !parsed.host_str().is_some_and(|h| h == "nexusmods.com" || h.ends_with(".nexusmods.com")) {
+        return Err("Not a Nexus Mods page".into());
+    }
+    let title = match name {
+        Some(n) if !n.trim().is_empty() => format!("Nexus Mods: {}", n.trim()),
+        _ => "Nexus Mods".to_string(),
+    };
+    *NEXUS_TARGET.lock().unwrap() = Some(url);
+    if let Some(w) = app.get_webview_window(NEXUS_WINDOW) {
+        if show.unwrap_or(false) {
+            let _ = w.show();
+            let _ = w.set_focus();
+            return Ok(());
+        }
+        let _ = w.hide();
+        w.navigate(parsed).map_err(|e| e.to_string())?;
+        let _ = w.set_title(&title);
+        return Ok(());
+    }
+    let handle = app.clone();
+    let w = tauri::WebviewWindowBuilder::new(&app, NEXUS_WINDOW, tauri::WebviewUrl::External(parsed))
+        .title(title)
+        .visible(show.unwrap_or(false))
+        .on_page_load(|w, payload| {
+            if payload.event() != tauri::webview::PageLoadEvent::Finished { return; }
+            if !payload.url().host_str().is_some_and(|h| h == "nexusmods.com" || h.ends_with(".nexusmods.com")) { return; }
+            if let Some(target) = NEXUS_TARGET.lock().unwrap().as_ref() {
+                let script = include_str!("nexus_helper.js").replace("__MM_INFO__", &serde_json::json!({ "url": target }).to_string());
+                let _ = w.eval(&script);
+            }
+        })
+        .inner_size(1100.0, 820.0)
+        .min_inner_size(600.0, 500.0)
+        .on_navigation(move |u| {
+            if u.scheme() == "mm-nexus" {
+                if let Some(w) = handle.get_webview_window(NEXUS_WINDOW) {
+                    match u.host_str() {
+                        Some("show") => { let _ = w.show(); let _ = w.set_focus(); }
+                        Some("hide") => { let _ = w.hide(); }
+                        _ => {}
+                    }
+                }
+                return false;
+            }
+            if u.scheme() == "nxm" {
+                let (app, link) = (handle.clone(), u.to_string());
+                tauri::async_runtime::spawn(async move {
+                    if let Err(e) = handle_nxm(&app, &link) {
+                        let _ = app.emit("nexus-error", e);
+                    }
+                });
+                return false;
+            }
+            u.scheme() == "https" && u.host_str().is_some_and(|h| h == "nexusmods.com" || h.ends_with(".nexusmods.com"))
+        })
+        .build()
+        .map_err(|e| e.to_string())?;
+    let handle = app.clone();
+    w.on_window_event(move |e| {
+        if matches!(e, tauri::WindowEvent::Destroyed) {
+            let _ = handle.emit("nexus-closed", ());
+        }
+    });
+    Ok(())
+}
+
+#[tauri::command]
+async fn nexus_browse_close(app: AppHandle) {
+    if let Some(w) = app.get_webview_window(NEXUS_WINDOW) {
+        let _ = w.close();
+    }
+}
+
 #[tauri::command]
 fn app_version(app: AppHandle) -> String {
     app.package_info().version.to_string()
@@ -1360,6 +1447,8 @@ pub fn run() {
             import_legacy,
             open_folder,
             open_url,
+            nexus_browse,
+            nexus_browse_close,
             app_version,
         ])
         .run(tauri::generate_context!())

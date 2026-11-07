@@ -1,6 +1,6 @@
 {
   "name": "mods-manager",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "private": true,
   "type": "module",
   "packageManager": "pnpm@11.1.2",
@@ -8,6 +8,7 @@
     "dev": "tauri dev --config src-tauri/tauri.dev.conf.json",
     "build": "tauri build",
     "dev:web": "vite",
+    "dev:data": "bash scripts/dev-data.sh",
     "build:web": "vue-tsc --noEmit && vite build",
     "typecheck": "vue-tsc --noEmit",
     "test": "cargo test --manifest-path src-tauri/Cargo.toml",

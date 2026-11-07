@@ -12,7 +12,7 @@ const groups = computed(() => {
   const running = q.filter((j) => j.status === "downloading" || j.status === "installing" || j.status === "removing");
   return [
     { title: "Running", jobs: running },
-    { title: "Waiting for a click on Nexus", jobs: q.filter((j) => j.status === "waiting") },
+    { title: "Preparing Nexus downloads", jobs: q.filter((j) => j.status === "waiting") },
     { title: "Queued", jobs: q.filter((j) => j.status === "queued") },
     { title: "Finished", jobs: q.filter((j) => j.status === "done" || j.status === "failed" || j.status === "cancelled").reverse() },
   ].filter((g) => g.jobs.length);
@@ -28,7 +28,7 @@ function detail(j: Job) {
   if (j.status === "downloading") return j.total ? `${bytes(j.done)} of ${bytes(j.total)}` : bytes(j.done) || "Starting…";
   if (j.status === "installing") return "Installing…";
   if (j.status === "removing") return "Removing…";
-  if (j.status === "waiting") return "Click Slow download on its Nexus page";
+  if (j.status === "waiting") return "Preparing download; log in if Nexus asks";
   if (j.status === "failed") return j.error ?? "Failed";
   if (j.status === "cancelled") return "Cancelled; Sync now gets it again";
   if (j.status === "done") return j.action === "remove" ? "Removed" : "Installed";
@@ -167,7 +167,7 @@ async function run(f: () => Promise<unknown>) {
                   <ChevronDown />
                 </button>
               </span>
-              <button v-if="j.status === 'waiting' && j.manualUrl" class="btn btn-sm" @click="run(() => api.openUrl(j.manualUrl!))"><ExternalLink /> Open</button>
+              <button v-if="j.status === 'waiting' && j.manualUrl" class="btn btn-sm" @click="run(() => api.nexusBrowse(j.manualUrl!, j.name, true))"><ExternalLink /> Open</button>
               <button v-if="j.status === 'failed'" class="btn btn-sm" @click="run(() => api.queueRetry(j.id))"><RotateCw /> Retry</button>
               <button v-if="j.status === 'cancelled'" class="btn btn-sm" @click="run(() => api.queueRetry(j.id))"><RotateCw /> Start again</button>
               <button

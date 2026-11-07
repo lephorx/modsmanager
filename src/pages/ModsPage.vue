@@ -237,22 +237,22 @@ function added(m: ModView) {
         <button v-else-if="automatic.length" class="btn btn-play btn-lg" @click="runSync()"><Download /> Sync now</button>
         <button v-else-if="manual.length && !store.nexusAssist" class="btn btn-primary btn-lg" @click="nextFromNexus()"><ExternalLink /> Get from Nexus</button>
       </div>
-      <!-- free Nexus accounts: one click per file on the website -->
+      <!-- Free Nexus accounts use the saved browser session. -->
       <div v-if="manual.length" class="inset nexus-strip">
         <template v-if="store.nexusAssist">
           <Loader2 class="spin" />
           <span class="stack" style="gap: 2px; flex: 1; min-width: 0">
             <strong class="ellipsis">Waiting for {{ manual[0]!.name }} from Nexus</strong>
-            <span class="hint">Click <strong>Slow download</strong> on the page that opened; Mods Manager takes it from there and opens the next one.</span>
+            <span class="hint">Downloads start automatically. Log in if the Nexus window appears; your session is remembered.</span>
           </span>
-          <button class="btn btn-sm" @click="nextFromNexus()">Open page again</button>
+          <button class="btn btn-sm" @click="nextFromNexus(true)">Show Nexus</button>
           <button class="btn btn-sm btn-ghost" @click="stopNexus()">Stop</button>
         </template>
         <template v-else>
           <ExternalLink />
           <span class="stack" style="gap: 2px; flex: 1; min-width: 0">
-            <strong>{{ count(manual.length, "mod") }} from Nexus Mods {{ manual.length === 1 ? "needs" : "need" }} a click each</strong>
-            <span class="hint">Without Nexus Premium, Nexus only allows downloads you click on its website. Mods Manager opens each exact file; you click Slow download.</span>
+            <strong>{{ count(manual.length, "mod") }} from Nexus Mods {{ manual.length === 1 ? "needs" : "need" }} a browser session</strong>
+            <span class="hint">Mods Manager selects Slow download automatically in the background. You only need to log in when Nexus asks.</span>
           </span>
           <button v-if="automatic.length" class="btn" @click="nextFromNexus()">Get {{ manual.length }} from Nexus</button>
         </template>
@@ -262,7 +262,7 @@ function added(m: ModView) {
         <div v-for="p in plan" :key="p.key" class="plan-row">
           <span class="plan-action" :class="ACTION[p.action].cls">{{ ACTION[p.action].label }}</span>
           <span class="ellipsis" style="font-weight: 600">{{ p.name }}</span>
-          <span v-if="p.manualUrl" class="chip" title="Needs a click on Nexus (no Premium)">Nexus · click</span>
+          <span v-if="p.manualUrl" class="chip" title="Downloads through the saved Nexus session">Nexus · click</span>
           <span class="spacer" />
           <span class="hint num">
             <template v-if="p.action === 'update'">{{ p.from }} → {{ p.to }}</template>

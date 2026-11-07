@@ -129,7 +129,7 @@ const nav = [
           <button
             class="btn btn-ghost btn-icon queue-button"
             :class="{ busy: queueBusy, attention: !queueBusy && (queueWaiting || queueFailed) }"
-            :title="queueBusy ? `${queueBusy} downloading or queued` : queueWaiting ? `${queueWaiting} waiting for a click on Nexus` : queueFailed ? `${queueFailed} failed` : 'Downloads'"
+            :title="queueBusy ? `${queueBusy} downloading or queued` : queueWaiting ? `${queueWaiting} preparing Nexus downloads` : queueFailed ? `${queueFailed} failed` : 'Downloads'"
             aria-label="Downloads"
             @click="store.queueOpen = true"
           >
