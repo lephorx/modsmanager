@@ -49,6 +49,8 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           releaseId: ${{ steps.release.outputs.id }}
+          # with the tag, latest.json links to this version's files (not "the latest release's")
+          tagName: ${{ github.ref_name }}
           includeUpdaterJson: true
       # everything is uploaded: now installed apps may see it
       - name: Publish the release
