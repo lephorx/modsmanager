@@ -34,6 +34,6 @@ jobs:
         with:
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
           releaseName: Mods Manager ${{ github.ref_name }}
-          releaseBody: Download the `.exe` setup below and run it (Windows may warn because the build isn't code-signed: More info → Run anyway). Installed apps update themselves.
+          releaseBody: "Download the `.exe` setup below and run it (Windows may warn because the build isn't code-signed: More info → Run anyway). Installed apps update themselves."
           releaseDraft: false
           includeUpdaterJson: true
