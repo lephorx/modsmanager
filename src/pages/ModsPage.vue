@@ -20,6 +20,7 @@ import {
   FolderCog,
   ListChecks,
   UserPlus,
+  Link2,
 } from "lucide-vue-next";
 import { api, isActive, LOADER_LABEL, type Action, type Job, type ModView } from "@/lib/api";
 import { checkUpdates, currentGame, gameJobs, hasPaths, nextFromNexus, nexusPending, refresh, runSync, stopNexus, store } from "@/lib/store";
@@ -36,6 +37,8 @@ const tab = ref<"all" | "content" | "code">("all");
 const query = ref("");
 const adding = ref(false);
 const reviewing = ref(false);
+/** "I already have this": link files in the folders to this mod */
+const adopting = ref<ModView | null>(null);
 const confirmRemove = ref<ModView | null>(null);
 const busy = ref<Record<number, boolean>>({});
 
@@ -156,6 +159,7 @@ function menu(m: ModView): RowMenuItem[] {
     icon: FolderOpen,
     action: () => void api.openFolder(m.gameId, m.target === "code" && o.value?.game.loader !== "none" ? "game" : "content").catch((e) => toast.error(errorText(e))),
   });
+  if (m.state !== "installed") items.push({ label: "I already have this…", icon: Link2, action: () => (adopting.value = m) });
   items.push({ label: "Remove for everyone", icon: Trash2, danger: true, action: () => (confirmRemove.value = m) });
   return items;
 }
@@ -300,7 +304,7 @@ function added(m: ModView) {
       <Package />
       <div class="stack" style="gap: 2px; flex: 1">
         <strong>{{ count(o.unmanaged, "item") }} in your mod folders {{ o.unmanaged === 1 ? "isn't" : "aren't" }} on the list</strong>
-        <span class="hint">The others don't have {{ o.unmanaged === 1 ? "it" : "these" }}. Delete or keep them.</span>
+        <span class="hint">If {{ o.unmanaged === 1 ? "it's" : "some are" }} a mod on the list, link {{ o.unmanaged === 1 ? "it" : "them" }} so nothing downloads again. Otherwise keep or delete.</span>
       </div>
       <button class="btn" @click="reviewing = true">Review</button>
     </div>
@@ -363,6 +367,7 @@ function added(m: ModView) {
 
     <AddModDialog v-if="adding" @close="adding = false" />
     <UnmanagedDialog v-if="reviewing && game" :game="game.id" @close="(reviewing = false), refresh()" />
+    <UnmanagedDialog v-if="adopting && game" :game="game.id" :for-mod="adopting" @close="(adopting = null), refresh()" />
     <AppDialog v-if="confirmRemove" title="Remove for everyone?" :width="440" @close="confirmRemove = null">
       <p>
         <strong>{{ confirmRemove.name }}</strong> comes off the shared list. Its files are deleted on this computer now, and on everyone

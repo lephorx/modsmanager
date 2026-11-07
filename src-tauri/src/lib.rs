@@ -1093,6 +1093,69 @@ async fn delete_unmanaged(state: State<'_, AppState>, game: i64, keys: Vec<Strin
     Ok(())
 }
 
+/// Unmanaged items (`content/<folder>`, `game/<path>`) as one install: its root and paths.
+fn adopted_paths(keys: &[String]) -> R<(Root, Vec<String>)> {
+    let mut root = None;
+    let mut paths = Vec::new();
+    for key in keys {
+        let (r, rel) = if let Some(rel) = key.strip_prefix("content/") {
+            (Root::Content, rel)
+        } else if let Some(rel) = key.strip_prefix("game/") {
+            (Root::Game, rel)
+        } else {
+            return Err(format!("Unknown file {key}"));
+        };
+        if *root.get_or_insert(r) != r {
+            return Err("A mod's files are either in the mods folder or in the game folder, not both".into());
+        }
+        if install::safe_join(std::path::Path::new("x"), rel).is_none() {
+            return Err(format!("Unknown file {key}"));
+        }
+        paths.push(rel.to_string());
+    }
+    Ok((root.ok_or("Choose at least one file or folder")?, paths))
+}
+
+/// "These files are that mod": records files already in the game's folders as the install of a
+/// mod on the list, so it isn't downloaded again. `exact`: they're the pinned version (counts as
+/// installed); otherwise it counts as another version and the next sync replaces them.
+#[tauri::command]
+async fn adopt(state: State<'_, AppState>, game: i64, mod_id: i64, keys: Vec<String>, exact: bool) -> R<()> {
+    let (db, _, _, paths) = state.game(game).await?;
+    let m = db::get_mod(&db, mod_id).await?;
+    if m.game_id != game {
+        return Err("That mod belongs to another game".into());
+    }
+    let (root, rels) = adopted_paths(&keys)?;
+    let base = install::root_dir(&paths, root);
+    if base.as_os_str().is_empty() {
+        return Err("Set this game's folders first (Edit game)".into());
+    }
+    for rel in &rels {
+        if !install::safe_join(&base, rel).is_some_and(|p| p.exists()) {
+            return Err(format!("{rel} isn't there anymore"));
+        }
+    }
+    let mut local = state.local.lock().await;
+    let lg = local.game_mut(game);
+    // the files may have been flagged "keep" before; they belong to a mod now
+    for key in &keys {
+        lg.ignored.remove(key);
+    }
+    lg.installed.insert(
+        m.data.key(),
+        Installed {
+            name: m.data.name.clone(),
+            pin: if exact { m.data.pin() } else { "adopted|".into() },
+            version: if exact { m.data.version.clone() } else { "unknown".into() },
+            root,
+            paths: rels,
+            installed_at: chrono::Utc::now(),
+        },
+    );
+    state.save_local(&local).await
+}
+
 #[tauri::command]
 async fn ignore_unmanaged(state: State<'_, AppState>, game: i64, keys: Vec<String>, ignore: bool) -> R<()> {
     let mut local = state.local.lock().await;
@@ -1293,6 +1356,7 @@ pub fn run() {
             unmanaged,
             delete_unmanaged,
             ignore_unmanaged,
+            adopt,
             import_legacy,
             open_folder,
             open_url,
@@ -1612,6 +1676,15 @@ mod e2e {
         let mut touched = Vec::new();
         assert_eq!(start_next(&q, &mut touched), Some(5));
         assert_eq!(q.get(5).unwrap().status, "downloading");
+    }
+
+    #[test]
+    fn adopted_files_keep_to_one_folder() {
+        assert_eq!(adopted_paths(&["content/A.Pallet".into(), "content/B".into()]).unwrap(), (Root::Content, vec!["A.Pallet".into(), "B".into()]));
+        assert_eq!(adopted_paths(&["game/BepInEx/plugins/Ns-Cool".into()]).unwrap(), (Root::Game, vec!["BepInEx/plugins/Ns-Cool".into()]));
+        assert!(adopted_paths(&["content/A".into(), "game/Mods/B.dll".into()]).is_err(), "not both folders");
+        assert!(adopted_paths(&["content/../evil".into()]).is_err());
+        assert!(adopted_paths(&[]).is_err());
     }
 
     #[test]

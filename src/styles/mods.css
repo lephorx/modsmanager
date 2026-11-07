@@ -710,3 +710,18 @@ html[data-design="modern"] .queue-progress > span {
   letter-spacing: 0;
   text-transform: none;
 }
+
+/* "this is that mod" */
+.unmanaged-row {
+  min-height: 46px;
+}
+.assign-select {
+  flex: 0 0 210px;
+  width: 210px;
+  height: 30px;
+  font-size: 12px;
+}
+.assign-select.set {
+  color: var(--tint);
+  font-weight: 600;
+}

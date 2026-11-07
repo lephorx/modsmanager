@@ -214,6 +214,7 @@ export const api = {
   unmanaged: (game: number) => invoke<Unmanaged[]>("unmanaged", { game }),
   deleteUnmanaged: (game: number, keys: string[]) => invoke<void>("delete_unmanaged", { game, keys }),
   ignoreUnmanaged: (game: number, keys: string[], ignore = true) => invoke<void>("ignore_unmanaged", { game, keys, ignore }),
+  adopt: (game: number, modId: number, keys: string[], exact: boolean) => invoke<void>("adopt", { game, modId, keys, exact }),
   importLegacy: (game: number) => invoke<[number, string[]]>("import_legacy", { game }),
   openFolder: (game: number, which: "content" | "game") => invoke<void>("open_folder", { game, which }),
   openUrl: (url: string) => invoke<void>("open_url", { url }),
