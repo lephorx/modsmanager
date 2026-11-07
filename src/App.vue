@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
 import { RouterLink, RouterView } from "vue-router";
-import { History, Layers, Settings as SettingsIcon } from "lucide-vue-next";
+import { History, Layers, Loader2, RefreshCw, Settings as SettingsIcon } from "lucide-vue-next";
 import markUrl from "./assets/mark.svg";
 import markWhiteUrl from "./assets/mark-white.svg";
 import Toast from "./components/AppToast.vue";
@@ -10,6 +10,7 @@ import SetupPage from "./pages/SetupPage.vue";
 import { settingsDialog, openSettings } from "./lib/settingsDialog";
 import { ONLINE_MS, loadSettings, refresh, setupDone, startEvents, store } from "./lib/store";
 import { ago } from "./lib/format";
+import { checkForUpdate, installUpdate, startUpdateChecks, updater } from "./lib/updater";
 
 const scrolled = ref(false);
 const ready = ref(false);
@@ -18,6 +19,7 @@ onMounted(async () => {
   await loadSettings();
   ready.value = true;
   await startEvents();
+  void startUpdateChecks();
   await refresh();
 });
 
@@ -69,6 +71,20 @@ const nav = [
           <span class="live" :class="{ on: store.live }" :title="store.live ? 'Live: changes show up right away' : 'Not connected to the shared list'">
             <span class="run-dot" />{{ store.live ? "Live" : "Offline" }}
           </span>
+          <button v-if="updater.available" class="update-badge" :disabled="updater.installing" :title="`Version ${updater.available.version} is ready`" @click="installUpdate">
+            <Loader2 v-if="updater.installing" class="spin" :size="16" /><RefreshCw v-else :size="16" />
+            {{ updater.installing ? (store.syncing ? "Waiting for the sync…" : updater.progress ? `Updating ${Math.round(updater.progress * 100)}%` : "Updating…") : "Restart to update" }}
+          </button>
+          <button
+            v-else
+            class="btn btn-ghost btn-icon"
+            :title="updater.current ? `Check for updates (you have ${updater.current})` : 'Check for updates'"
+            aria-label="Check for updates"
+            :disabled="updater.checking"
+            @click="checkForUpdate(true)"
+          >
+            <RefreshCw :class="{ spin: updater.checking }" />
+          </button>
           <button class="btn btn-ghost btn-icon" title="Settings" aria-label="Settings" @click="openSettings()"><SettingsIcon /></button>
         </div>
       </header>

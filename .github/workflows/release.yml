@@ -28,8 +28,12 @@ jobs:
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # signs the update; the app's updater refuses unsigned ones
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
           releaseName: Mods Manager ${{ github.ref_name }}
-          releaseBody: Download the `.exe` setup below and run it. Windows may warn because the build isn't signed: More info → Run anyway.
+          releaseBody: Download the `.exe` setup below and run it (Windows may warn because the build isn't code-signed: More info → Run anyway). Installed apps update themselves.
           releaseDraft: false
+          includeUpdaterJson: true
