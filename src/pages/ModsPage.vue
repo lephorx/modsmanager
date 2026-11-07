@@ -21,7 +21,7 @@ import {
   UserPlus,
 } from "lucide-vue-next";
 import { api, LOADER_LABEL, type Action, type ModView } from "@/lib/api";
-import { checkUpdates, currentGame, hasPaths, refresh, runSync, store } from "@/lib/store";
+import { checkUpdates, currentGame, hasPaths, nextFromNexus, nexusPending, refresh, runSync, stopNexus, store } from "@/lib/store";
 import { gameDialog } from "@/lib/dialogs";
 import { ago, hideImg, bytes, count, SOURCE_LABEL } from "@/lib/format";
 import { errorText, toast } from "@/lib/toast";
@@ -60,6 +60,9 @@ const counts = computed(() => ({
   code: mods.value.filter((m) => m.target === "code").length,
 }));
 const plan = computed(() => o.value?.plan ?? []);
+const manual = computed(() => nexusPending());
+/** what Sync now can do on its own */
+const automatic = computed(() => plan.value.filter((p) => !p.manualUrl));
 const planSize = computed(() => plan.value.reduce((n, p) => n + (p.action === "remove" ? 0 : p.size), 0));
 const updateCount = computed(() => Object.keys(store.updates).length);
 
@@ -211,16 +214,38 @@ function added(m: ModView) {
             <template v-else>Someone changed the list, or something here doesn't match it.<template v-if="planSize"> About {{ bytes(planSize) }} to download.</template></template>
           </span>
         </div>
-        <button class="btn btn-play btn-lg" :disabled="store.syncing" @click="runSync()">
+        <button v-if="automatic.length || store.syncing" class="btn btn-play btn-lg" :disabled="store.syncing" @click="runSync()">
           <Loader2 v-if="store.syncing" class="spin" /><Download v-else />
           {{ store.syncing ? `${percent}%` : "Sync now" }}
         </button>
+        <button v-else-if="manual.length && !store.nexusAssist" class="btn btn-primary btn-lg" @click="nextFromNexus()"><ExternalLink /> Get from Nexus</button>
+      </div>
+      <!-- free Nexus accounts: one click per file on the website -->
+      <div v-if="manual.length && !store.syncing" class="inset nexus-strip">
+        <template v-if="store.nexusAssist">
+          <Loader2 class="spin" />
+          <span class="stack" style="gap: 2px; flex: 1; min-width: 0">
+            <strong class="ellipsis">Waiting for {{ manual[0]!.name }} from Nexus</strong>
+            <span class="hint">Click <strong>Slow download</strong> on the page that opened; Mods Manager takes it from there and opens the next one.</span>
+          </span>
+          <button class="btn btn-sm" @click="nextFromNexus()">Open page again</button>
+          <button class="btn btn-sm btn-ghost" @click="stopNexus()">Stop</button>
+        </template>
+        <template v-else>
+          <ExternalLink />
+          <span class="stack" style="gap: 2px; flex: 1; min-width: 0">
+            <strong>{{ count(manual.length, "mod") }} from Nexus Mods {{ manual.length === 1 ? "needs" : "need" }} a click each</strong>
+            <span class="hint">Without Nexus Premium, Nexus only allows downloads you click on its website. Mods Manager opens each exact file; you click Slow download.</span>
+          </span>
+          <button v-if="automatic.length" class="btn" @click="nextFromNexus()">Get {{ manual.length }} from Nexus</button>
+        </template>
       </div>
       <div v-if="store.syncing" class="progress" style="margin-top: 14px"><div :style="{ width: `${Math.max(percent, 3)}%` }" /></div>
       <div v-else class="inset plan">
         <div v-for="p in plan" :key="p.key" class="plan-row">
           <span class="plan-action" :class="ACTION[p.action].cls">{{ ACTION[p.action].label }}</span>
           <span class="ellipsis" style="font-weight: 600">{{ p.name }}</span>
+          <span v-if="p.manualUrl" class="chip" title="Needs a click on Nexus (no Premium)">Nexus · click</span>
           <span class="spacer" />
           <span class="hint num">
             <template v-if="p.action === 'update'">{{ p.from }} → {{ p.to }}</template>

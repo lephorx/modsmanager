@@ -10,6 +10,9 @@ export interface Settings {
   databaseUrl: string;
   modioApiKey: string;
   modioToken: string;
+  nexusApiKey: string;
+  /** leave nxm:// links to another mod manager */
+  nexusIgnoreLinks: boolean;
   autoSync: boolean;
   currentGame: number | null;
   games: Record<string, GamePaths>;
@@ -22,6 +25,8 @@ export interface NewGame {
   modioId: number;
   modioSlug: string;
   thunderstore: string;
+  /** as in nexusmods.com/<game> */
+  nexus: string;
   loader: Loader;
   steamDir: string;
   contentHint: string;
@@ -37,7 +42,7 @@ export interface GameView extends Game {
   paths: GamePaths;
 }
 
-export type Source = "modio" | "thunderstore" | "link";
+export type Source = "modio" | "thunderstore" | "nexus" | "link";
 export type Target = "content" | "code";
 
 export interface NewMod {
@@ -83,6 +88,8 @@ export interface PlanItem {
   to: string | null;
   size: number;
   target: Target;
+  /** Nexus Mods without Premium: the page to click "Slow download" on */
+  manualUrl: string | null;
 }
 
 export interface Member {
@@ -104,6 +111,12 @@ export interface Overview {
   loaderOk: boolean;
   needsLoader: boolean;
   live: boolean;
+  nexus: NexusAccount | null;
+}
+
+export interface NexusAccount {
+  name: string;
+  premium: boolean;
 }
 
 export interface Resolved {
@@ -151,6 +164,8 @@ export interface Progress {
 export interface SyncResult {
   done: number;
   failed: [string, string][];
+  /** Nexus files waiting for a click on the website: [name, page] */
+  waiting: [string, string][];
 }
 
 export interface Invite {
@@ -165,6 +180,8 @@ export const api = {
   saveSettings: (settings: Settings) => invoke<void>("save_settings", { settings }),
   detectFolders: (steamDir: string, contentHint: string) => invoke<GamePaths>("detect_folders", { steamDir, contentHint }),
   testConnection: (url: string) => invoke<void>("test_connection", { url }),
+  nexusAccount: () => invoke<NexusAccount | null>("nexus_account"),
+  nexusLink: (url: string) => invoke<void>("nexus_link", { url }),
   inviteCode: (game: number | null) => invoke<string>("invite_code", { game }),
   readInvite: (code: string) => invoke<Invite>("read_invite", { code }),
 

@@ -18,6 +18,8 @@ export const store = reactive({
   /** newer files found by "Check for updates", by mod id (for the shown game) */
   updates: {} as Record<string, NewMod>,
   checking: false,
+  /** walking through Nexus files a free account has to click, one page at a time */
+  nexusAssist: false,
 });
 
 export const ONLINE_MS = 150_000;
@@ -94,6 +96,8 @@ export async function runSync() {
       toast.error(`${r.failed.length} couldn't sync: ${r.failed.map(([n, e]) => `${n} (${e})`).join("; ")}`);
     } else if (r.done) {
       toast.success(r.done === 1 ? "1 change synced" : `${r.done} changes synced`);
+    } else if (r.waiting.length && !store.nexusAssist) {
+      toast.info(r.waiting.length === 1 ? "1 mod from Nexus needs a click" : `${r.waiting.length} mods from Nexus need a click`);
     }
   } catch (e) {
     toast.error(errorText(e));
@@ -119,6 +123,27 @@ export async function checkUpdates(quiet = false) {
   }
 }
 
+/** Nexus files this computer still has to click on the website (free accounts). */
+export function nexusPending() {
+  return (store.overview?.plan ?? []).filter((p) => p.manualUrl);
+}
+
+/** Opens the next Nexus file's page; the click there comes back as an nxm:// link. */
+export function nextFromNexus() {
+  const next = nexusPending()[0];
+  if (!next?.manualUrl) {
+    if (store.nexusAssist) toast.success("Everything from Nexus is installed");
+    store.nexusAssist = false;
+    return;
+  }
+  store.nexusAssist = true;
+  void api.openUrl(next.manualUrl);
+}
+
+export function stopNexus() {
+  store.nexusAssist = false;
+}
+
 const VERBS: Record<string, string> = { add: "added", update: "updated", remove: "removed", import: "imported" };
 
 let started = false;
@@ -129,6 +154,18 @@ export async function startEvents() {
     store.progress = e.payload.phase === "done" ? null : e.payload;
   });
   await listen<boolean>("live", (e) => (store.live = e.payload));
+  // a "Mod Manager Download" click on Nexus: install that file, then open the next one
+  await listen<{ modId: string; fileId: string }>("nexus-link", async (e) => {
+    const m = store.overview?.mods.find((x) => x.source === "nexus" && x.sourceId === e.payload.modId);
+    if (m && m.fileRef !== e.payload.fileId) {
+      toast.error(`That's a different file of ${m.name} than the one on the list; use the page Mods Manager opened`);
+      return;
+    }
+    toast.info(m ? `Got ${m.name} from Nexus, installing…` : "Got a file from Nexus");
+    while (store.syncing) await new Promise((r) => setTimeout(r, 300));
+    await runSync();
+    if (store.nexusAssist) nextFromNexus();
+  });
   await listen<string>("remote-changed", async (e) => {
     let change: { game?: number; actor?: string; action?: string; name?: string } = {};
     try {

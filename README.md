@@ -22,6 +22,7 @@ Presets for **BONELAB**, **Blade & Sorcery** and **Lethal Company**; any other g
 | Setting | Example |
 | --- | --- |
 | mod.io game | `bladeandsorcery` (the id is looked up for you) |
+| Nexus Mods game | `bladeandsorcery`, as in nexusmods.com/bladeandsorcery |
 | Thunderstore community | `lethal-company` |
 | Code mods | MelonLoader, BepInEx, or none |
 
@@ -29,9 +30,20 @@ Presets for **BONELAB**, **Blade & Sorcery** and **Lethal Company**; any other g
 | --- | --- | --- |
 | mod.io | the mod's page, a mod id, or search in the app | the game's mods folder |
 | Thunderstore | the package page | the game folder in the loader's layout: MelonLoader (`Mods/`, `Plugins/`, `UserLibs/`, `UserData/`) or BepInEx (`BepInEx/plugins/<package>/…`, like r2modman; BepInExPack itself installs into the game folder). Dependencies come along. |
+| Nexus Mods | the mod's page (newest main file), or a file link with `?tab=files&file_id=…` | the mods folder or the game folder, you choose |
 | Direct link | any `https://…` file | the mods folder or the game folder, you choose |
 
 mod.io downloads are checked against mod.io's MD5, links against the pinned SHA-256. Each computer sets its own folders per game (found automatically for Steam installs).
+
+### Nexus Mods without Premium
+
+Nexus only gives API download links to Premium accounts, or to a free account right after it clicked **Mod Manager Download** on the website. So with a free account (add its personal API key in *Settings → Nexus Mods*):
+
+1. **Sync now** installs everything from mod.io, Thunderstore and links, and lists the Nexus mods that need a click.
+2. **Get from Nexus** opens the exact pinned file's page; click **Slow download**.
+3. Nexus hands the click to Mods Manager (`nxm://` link), which downloads exactly that file, installs it, and opens the next one.
+
+With Premium, Nexus mods sync on their own. Mods Manager opens `nxm://` links while a Nexus key is set; turn that off in Settings if Vortex or Mod Organizer should get them. If the browser doesn't open the app, copy the "Mod Manager Download" link and paste it in *Settings → Nexus Mods*.
 
 ## Setup
 

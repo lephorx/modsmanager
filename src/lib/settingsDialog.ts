@@ -2,7 +2,7 @@ import { reactive } from "vue";
 import { api, type Settings } from "./api";
 import { refresh, store } from "./store";
 
-export type SettingsSection = "profile" | "shared" | "sync" | "games" | "modio" | "appearance" | "maintenance";
+export type SettingsSection = "profile" | "shared" | "sync" | "games" | "modio" | "nexus" | "appearance" | "maintenance";
 
 export const settingsDialog = reactive({ open: false, section: "profile" as SettingsSection });
 

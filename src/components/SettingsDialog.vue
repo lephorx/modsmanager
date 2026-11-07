@@ -1,11 +1,11 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref, type Component } from "vue";
-import { Check, CircleCheck, Database, FolderCog, FolderOpen, Gamepad2, KeyRound, Loader2, Paintbrush, Pencil, Plus, RefreshCw, User, UserPlus, Wrench, X, Zap } from "lucide-vue-next";
+import { onMounted, onUnmounted, ref, watch, type Component } from "vue";
+import { Check, CircleCheck, Database, FolderCog, FolderOpen, Gamepad2, KeyRound, Loader2, Paintbrush, Pencil, Plus, RefreshCw, Link2, Crown, User, UserPlus, Wrench, X, Zap } from "lucide-vue-next";
 import markUrl from "@/assets/mark.svg";
 import SecretInput from "./SecretInput.vue";
 import UnmanagedDialog from "./UnmanagedDialog.vue";
 import InviteDialog from "./InviteDialog.vue";
-import { api, DB_PLACEHOLDER, LOADER_LABEL, type Settings } from "@/lib/api";
+import { api, DB_PLACEHOLDER, LOADER_LABEL, type NexusAccount, type Settings } from "@/lib/api";
 import { saveSettings, settingsDialog, type SettingsSection } from "@/lib/settingsDialog";
 import { gameDialog } from "@/lib/dialogs";
 import { currentDesign, setDesign, type Design } from "@/lib/design";
@@ -22,7 +22,13 @@ const groups: { title: string; items: { id: SettingsSection; label: string; icon
       { id: "sync", label: "Syncing", icon: Zap },
     ],
   },
-  { title: "Sources", items: [{ id: "modio", label: "mod.io", icon: KeyRound }] },
+  {
+    title: "Sources",
+    items: [
+      { id: "modio", label: "mod.io", icon: KeyRound },
+      { id: "nexus", label: "Nexus Mods", icon: Link2 },
+    ],
+  },
   {
     title: "App",
     items: [
@@ -42,6 +48,40 @@ const importing = ref(false);
 const reviewing = ref(false);
 const inviting = ref(false);
 const game = () => store.games?.find((g) => g.id === currentGame()) ?? null;
+
+const nexus = ref<NexusAccount | null>(null);
+const nexusChecking = ref(false);
+const nexusError = ref("");
+const nxmLink = ref("");
+// bound, not inline: vue-tsc mis-parses the // in a static attribute
+const NXM_PLACEHOLDER = "nxm://…";
+async function checkNexus() {
+  nexusError.value = "";
+  nexus.value = null;
+  if (!store.settings?.nexusApiKey.trim()) return;
+  nexusChecking.value = true;
+  try {
+    nexus.value = await api.nexusAccount();
+  } catch (e) {
+    nexusError.value = errorText(e);
+  } finally {
+    nexusChecking.value = false;
+  }
+}
+watch(
+  () => [settingsDialog.section, store.settings?.nexusApiKey],
+  () => settingsDialog.section === "nexus" && void checkNexus(),
+  { immediate: true },
+);
+async function pasteNxm() {
+  try {
+    await api.nexusLink(nxmLink.value.trim());
+    nxmLink.value = "";
+    toast.success("Got it; the sync installs it now");
+  } catch (e) {
+    toast.error(errorText(e));
+  }
+}
 
 const close = () => (settingsDialog.open = false);
 function onKey(e: KeyboardEvent) {
@@ -222,6 +262,44 @@ function openFolder(which: "content" | "game") {
                 <h3 class="set-title">OAuth token <span class="hint">(optional)</span></h3>
                 <p class="set-hint">Only needed if downloads fail with "unauthorized": some files need a signed-in mod.io user. Create one under API access → OAuth 2 tokens.</p>
                 <SecretInput v-model="s.modioToken" @done="commit('modioToken')" />
+              </div>
+            </template>
+
+            <template v-else-if="settingsDialog.section === 'nexus'">
+              <div class="set-block">
+                <h3 class="set-title">API key</h3>
+                <p class="set-hint">For Nexus Mods games. Find it on nexusmods.com → your avatar → Site preferences → API Keys (Personal API Key, at the bottom).</p>
+                <SecretInput v-model="s.nexusApiKey" @done="commit('nexusApiKey')" />
+                <p v-if="nexusChecking" class="set-hint row" style="gap: 6px"><Loader2 class="spin" :size="14" /> Checking the key…</p>
+                <p v-else-if="nexusError" class="error-text selectable">{{ nexusError }}</p>
+                <p v-else-if="nexus" class="set-hint row" style="gap: 6px">
+                  <Crown v-if="nexus.premium" :size="14" style="color: var(--status-orange)" /><CircleCheck v-else :size="14" style="color: var(--status-green)" />
+                  <span>
+                    <strong>{{ nexus.name }}</strong> ·
+                    {{ nexus.premium ? "Premium: Nexus mods sync on their own." : "Free account: each Nexus mod needs one click on the website per computer. Sync opens the exact file; you click Slow download." }}
+                  </span>
+                </p>
+              </div>
+              <div class="set-block">
+                <div class="set-table">
+                  <label class="set-row">
+                    <div class="stack" style="gap: 2px; flex: 1">
+                      <strong>Open "Mod Manager Download" links</strong>
+                      <span class="hint">Nexus hands the click to Mods Manager (nxm:// links). Turn off if Vortex or Mod Organizer should get them instead.</span>
+                    </div>
+                    <span class="switch">
+                      <input type="checkbox" :checked="!s.nexusIgnoreLinks" @change="(s.nexusIgnoreLinks = !($event.target as HTMLInputElement).checked), commit('nexusIgnoreLinks')" /><span />
+                    </span>
+                  </label>
+                </div>
+              </div>
+              <div class="set-block">
+                <h3 class="set-title">Paste a download link</h3>
+                <p class="set-hint">If the browser doesn't open Mods Manager: right-click "Mod Manager Download" on the file, copy the link (nxm://…), paste it here.</p>
+                <div class="row" style="gap: 8px">
+                  <SecretInput v-model="nxmLink" :placeholder="NXM_PLACEHOLDER" style="flex: 1" />
+                  <button class="btn" :disabled="!nxmLink.trim()" @click="pasteNxm">Use link</button>
+                </div>
               </div>
             </template>
 

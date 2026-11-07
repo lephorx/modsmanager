@@ -22,7 +22,8 @@ use tokio_postgres::Client;
 
 use config::{GamePaths, Installed, Local, LocalGame, Root, Settings};
 use db::{Event, Game, Member, NewGame, NewMod, SharedMod};
-use sources::{AddOptions, Ctx, Resolved, SearchHit};
+use sources::{nexus, AddOptions, Ctx, Resolved, SearchHit};
+use tauri_plugin_deep_link::DeepLinkExt;
 
 type R<T> = Result<T, String>;
 
@@ -39,6 +40,10 @@ pub struct AppState {
     live: AtomicBool,
     /// v0.1.0's local data was looked at this run.
     local_migrated: AtomicBool,
+    /// One-time Nexus download keys from clicked `nxm://` links.
+    nxm: Arc<nexus::NxmKeys>,
+    /// Who the Nexus API key belongs to (checked once per key).
+    nexus_account: Mutex<Option<nexus::Account>>,
 }
 
 impl AppState {
@@ -128,7 +133,22 @@ impl AppState {
     }
 
     fn ctx<'a>(&'a self, settings: &'a Settings, game: &'a Game) -> Ctx<'a> {
-        Ctx { http: &self.http, settings, temp: &self.temp, game }
+        Ctx { http: &self.http, settings, temp: &self.temp, game, nxm: &self.nxm }
+    }
+
+    /// The Nexus account behind the API key (None without a key or when Nexus can't be reached).
+    async fn nexus_account(&self, refresh: bool) -> Option<nexus::Account> {
+        let key = self.settings.read().await.nexus_api_key.trim().to_string();
+        if key.is_empty() {
+            return None;
+        }
+        let mut cached = self.nexus_account.lock().await;
+        if cached.is_none() || refresh {
+            if let Ok(a) = nexus::account(&self.http, &key).await {
+                *cached = Some(a);
+            }
+        }
+        cached.clone()
     }
 }
 
@@ -156,6 +176,8 @@ pub struct PlanItem {
     to: Option<String>,
     size: i64,
     target: String,
+    /// Nexus Mods without Premium: the page to click "Slow download" on
+    manual_url: Option<String>,
 }
 
 fn state_of(paths: &GamePaths, local: &LocalGame, m: &SharedMod) -> &'static str {
@@ -186,6 +208,7 @@ fn plan(paths: &GamePaths, local: &LocalGame, mods: &[SharedMod]) -> Vec<PlanIte
             to: Some(m.data.version.clone()),
             size: m.data.file_size,
             target: m.data.target.clone(),
+            manual_url: None,
         });
     }
     for (key, inst) in &local.installed {
@@ -199,6 +222,7 @@ fn plan(paths: &GamePaths, local: &LocalGame, mods: &[SharedMod]) -> Vec<PlanIte
                 to: None,
                 size: 0,
                 target: if inst.root == Root::Game { "code".into() } else { "content".into() },
+                manual_url: None,
             });
         }
     }
@@ -220,6 +244,8 @@ pub struct Overview {
     /// Code mods are on the list, so the loader is needed
     needs_loader: bool,
     live: bool,
+    /// The Nexus account, when a key is set
+    nexus: Option<nexus::Account>,
 }
 
 #[derive(Serialize)]
@@ -240,12 +266,61 @@ async fn get_settings(state: State<'_, AppState>) -> R<Settings> {
 
 #[tauri::command]
 async fn save_settings(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> R<()> {
-    let url_changed = state.settings.read().await.database_url != settings.database_url;
+    let (url_changed, nexus_changed) = {
+        let old = state.settings.read().await;
+        (old.database_url != settings.database_url, old.nexus_api_key != settings.nexus_api_key || old.nexus_ignore_links != settings.nexus_ignore_links)
+    };
     config::save(&state.settings_path(), &settings)?;
     *state.settings.write().await = settings;
     if url_changed {
         *state.db.lock().await = None;
         start_listener(&app);
+    }
+    if nexus_changed {
+        *state.nexus_account.lock().await = None;
+        apply_nxm(&app).await;
+    }
+    Ok(())
+}
+
+/// The Nexus account behind the key: name, and whether it's Premium.
+#[tauri::command]
+async fn nexus_account(state: State<'_, AppState>) -> R<Option<nexus::Account>> {
+    let key = state.settings.read().await.nexus_api_key.trim().to_string();
+    if key.is_empty() {
+        return Ok(None);
+    }
+    let a = nexus::account(&state.http, &key).await?;
+    *state.nexus_account.lock().await = Some(a.clone());
+    Ok(Some(a))
+}
+
+/// A "Mod Manager Download" from the website (also pasted by hand): remember its one-time key.
+#[tauri::command]
+fn nexus_link(app: AppHandle, url: String) -> R<()> {
+    handle_nxm(&app, &url)
+}
+
+/// Mods Manager opens `nxm://` links while a Nexus key is set (unless left to e.g. Vortex).
+async fn apply_nxm(app: &AppHandle) {
+    let s = app.state::<AppState>().settings.read().await.clone();
+    let dl = app.deep_link();
+    if !s.nexus_api_key.trim().is_empty() && !s.nexus_ignore_links {
+        let _ = dl.register("nxm");
+    } else if dl.is_registered("nxm").unwrap_or(false) {
+        let _ = dl.unregister("nxm");
+    }
+}
+
+fn handle_nxm(app: &AppHandle, link: &str) -> R<()> {
+    let l = nexus::parse_nxm(link).ok_or("That isn't a Nexus Mods download link (nxm://…)")?;
+    let key = l.key.ok_or("That link has no download key; use \"Mod Manager Download\" on the file's page")?;
+    let state = app.state::<AppState>();
+    state.nxm.lock().unwrap().insert(format!("{}:{}", l.mod_id, l.file_id), key);
+    let _ = app.emit("nexus-link", serde_json::json!({ "domain": l.domain, "modId": l.mod_id, "fileId": l.file_id }));
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.unminimize();
+        let _ = w.set_focus();
     }
     Ok(())
 }
@@ -402,7 +477,16 @@ async fn overview(state: State<'_, AppState>, game: i64) -> R<Overview> {
     let (db, settings, g, paths) = state.game(game).await?;
     let mods = db::list_mods(&db, game).await?;
     let local = state.local.lock().await.game(game);
-    let plan = plan(&paths, &local, &mods);
+    let mut plan = plan(&paths, &local, &mods);
+    let has_nexus = mods.iter().any(|m| m.data.source == "nexus");
+    let nexus_acc = if has_nexus || !settings.nexus_api_key.trim().is_empty() { state.nexus_account(false).await } else { None };
+    if has_nexus && !nexus_acc.as_ref().is_some_and(|a| a.premium) {
+        for item in plan.iter_mut() {
+            if let Some(m) = mods.iter().find(|m| Some(m.id) == item.id && m.data.source == "nexus") {
+                item.manual_url = Some(nexus::file_page(&g.data.nexus, &m.data.source_id, &m.data.file_ref));
+            }
+        }
+    }
     let me = settings.name.trim().to_string();
     if !me.is_empty() {
         db::heartbeat(&db, &me, game, plan.len() as i32, plan.is_empty()).await?;
@@ -423,6 +507,7 @@ async fn overview(state: State<'_, AppState>, game: i64) -> R<Overview> {
         loader_ok: install::loader_installed(&paths, &g.data.loader),
         needs_loader,
         live: state.live.load(Ordering::Relaxed),
+        nexus: nexus_acc,
         game: g,
         paths,
         mods: views,
@@ -477,9 +562,9 @@ async fn check_updates(state: State<'_, AppState>, game: i64) -> R<HashMap<i64, 
     // each lookup owns what it needs: borrowed futures in a stream trip up the command's Send bound
     let (settings, g) = (Arc::new(settings), Arc::new(g));
     let lookups = mods.into_iter().map(|m| {
-        let (http, settings, temp, g) = (state.http.clone(), settings.clone(), state.temp.clone(), g.clone());
+        let (http, settings, temp, g, nxm) = (state.http.clone(), settings.clone(), state.temp.clone(), g.clone(), state.nxm.clone());
         tauri::async_runtime::spawn(async move {
-            let ctx = Ctx { http: &http, settings: &settings, temp: &temp, game: &g };
+            let ctx = Ctx { http: &http, settings: &settings, temp: &temp, game: &g, nxm: &nxm };
             (m.id, sources::latest(&ctx, &m.data, false).await)
         })
     });
@@ -547,6 +632,8 @@ struct Progress {
 pub struct SyncResult {
     done: usize,
     failed: Vec<(String, String)>,
+    /// Nexus Mods files a free account has to click on the website: (name, page)
+    waiting: Vec<(String, String)>,
 }
 
 /// The folder a code mod gets for itself (BepInEx plugins): Thunderstore's `Namespace-Name`.
@@ -626,7 +713,7 @@ async fn run_sync(state: &AppState, game: i64, emit: &(dyn Fn(Progress) + Send +
     let mods = db::list_mods(&db, game).await?;
     let items = plan(&paths, &state.local.lock().await.game(game), &mods);
     let count = items.len();
-    let mut result = SyncResult { done: 0, failed: vec![] };
+    let mut result = SyncResult { done: 0, failed: vec![], waiting: vec![] };
     for (index, item) in items.iter().enumerate() {
         let progress = Progress { game, index, count, name: item.name.clone(), action: item.action, phase: "removing", done: 0, total: 0 };
         let old = state.local.lock().await.game(game).installed.get(&item.key).cloned();
@@ -660,13 +747,17 @@ async fn run_sync(state: &AppState, game: i64, emit: &(dyn Fn(Progress) + Send +
                 state.save_local(&local).await?;
                 result.done += 1;
             }
-            Err(e) => result.failed.push((item.name.clone(), e)),
+            Err(e) => match e.strip_prefix(nexus::NEEDS_CLICK) {
+                Some(page) => result.waiting.push((item.name.clone(), page.to_string())),
+                None => result.failed.push((item.name.clone(), e)),
+            },
         }
     }
     emit(Progress { game, index: count, count, name: String::new(), action: "install", phase: "done", done: 0, total: 0 });
     let me = settings.name.trim();
     if !me.is_empty() {
-        db::heartbeat(&db, me, game, result.failed.len() as i32, result.failed.is_empty()).await?;
+        let left = (result.failed.len() + result.waiting.len()) as i32;
+        db::heartbeat(&db, me, game, left, left == 0).await?;
         if count > 0 {
             db::notify(&db, game, me, "synced", "").await?;
         }
@@ -806,6 +897,18 @@ fn start_listener(app: &AppHandle) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // first: a second start (an nxm:// link clicked while open) hands its link to this one
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            // an nxm:// link clicked in the browser starts a second copy; its link lands here
+            for arg in argv.iter().filter(|a| a.starts_with("nxm://")) {
+                let _ = handle_nxm(app, arg);
+            }
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.unminimize();
+                let _ = w.set_focus();
+            }
+        }))
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -833,13 +936,32 @@ pub fn run() {
                 listener: std::sync::Mutex::new(None),
                 live: AtomicBool::new(false),
                 local_migrated: AtomicBool::new(false),
+                nxm: Arc::new(Default::default()),
+                nexus_account: Mutex::new(None),
             });
             start_listener(app.handle());
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move { apply_nxm(&handle).await });
+            // started by a click on an nxm:// link: keep its key, tell the window once it's listening
+            // (the deep-link plugin only reports schemes the installer registers, and the installer
+            // shouldn't take nxm:// from Vortex, so the arguments are read here)
+            let links: Vec<String> = std::env::args().skip(1).filter(|a| a.starts_with("nxm://")).collect();
+            if !links.is_empty() {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    for l in links {
+                        let _ = handle_nxm(&handle, &l);
+                    }
+                });
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             get_settings,
             save_settings,
+            nexus_account,
+            nexus_link,
             detect_folders,
             test_connection,
             invite_code,
@@ -899,6 +1021,8 @@ mod e2e {
             listener: std::sync::Mutex::new(None),
             live: AtomicBool::new(false),
             local_migrated: AtomicBool::new(false),
+            nxm: Arc::new(Default::default()),
+            nexus_account: Mutex::new(None),
         }
     }
 

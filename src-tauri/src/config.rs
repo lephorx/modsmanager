@@ -16,6 +16,10 @@ pub struct Settings {
     pub modio_api_key: String,
     /// Optional mod.io OAuth token: some downloads need a signed-in user.
     pub modio_token: String,
+    /// Nexus Mods personal API key (nexusmods.com → Site preferences → API Keys).
+    pub nexus_api_key: String,
+    /// Leave `nxm://` links ("Mod Manager Download") to another mod manager such as Vortex.
+    pub nexus_ignore_links: bool,
     /// Run a sync on its own when someone changes the list.
     pub auto_sync: bool,
     /// The game the window shows.

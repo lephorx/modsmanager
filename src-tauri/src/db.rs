@@ -68,6 +68,7 @@ CREATE TABLE IF NOT EXISTS mm_presence (
 -- v0.1.0 → games
 ALTER TABLE mm_mods ADD COLUMN IF NOT EXISTS game_id BIGINT;
 ALTER TABLE mm_events ADD COLUMN IF NOT EXISTS game_id BIGINT;
+ALTER TABLE mm_games ADD COLUMN IF NOT EXISTS nexus TEXT NOT NULL DEFAULT '';
 ALTER TABLE mm_mods DROP CONSTRAINT IF EXISTS mm_mods_source_source_id_key;
 CREATE UNIQUE INDEX IF NOT EXISTS mm_mods_game_source ON mm_mods (game_id, source, source_id);
 CREATE INDEX IF NOT EXISTS mm_events_game ON mm_events (game_id, id DESC);
@@ -93,6 +94,8 @@ pub struct NewGame {
     pub modio_slug: String,
     /// Thunderstore community, as in thunderstore.io/c/<community>
     pub thunderstore: String,
+    /// Nexus Mods game, as in nexusmods.com/<game>
+    pub nexus: String,
     /// How code mods are loaded: `melonloader`, `bepinex` or `none`
     pub loader: String,
     /// Its folder under steamapps/common, to find it
@@ -108,6 +111,7 @@ pub fn presets() -> Vec<NewGame> {
             modio_id: BONELAB_MODIO,
             modio_slug: "bonelab".into(),
             thunderstore: "bonelab".into(),
+            nexus: "bonelab".into(),
             loader: "melonloader".into(),
             steam_dir: "BONELAB".into(),
             content_hint: "%LOCALLOW%/Stress Level Zero/BONELAB/Mods".into(),
@@ -117,6 +121,7 @@ pub fn presets() -> Vec<NewGame> {
             modio_id: 0,
             modio_slug: "bladeandsorcery".into(),
             thunderstore: String::new(),
+            nexus: "bladeandsorcery".into(),
             loader: "none".into(),
             steam_dir: "Blade & Sorcery".into(),
             content_hint: "%GAME%/BladeAndSorcery_Data/StreamingAssets/Mods".into(),
@@ -126,6 +131,7 @@ pub fn presets() -> Vec<NewGame> {
             modio_id: 0,
             modio_slug: String::new(),
             thunderstore: "lethal-company".into(),
+            nexus: "lethalcompany".into(),
             loader: "bepinex".into(),
             steam_dir: "Lethal Company".into(),
             content_hint: String::new(),
@@ -334,7 +340,7 @@ pub fn err<E: std::fmt::Display>(e: E) -> String {
 
 // ── games ──────────────────────────────────────────────────────────────────
 
-const GAME_COLUMNS: &str = "id, name, modio_id, modio_slug, thunderstore, loader, steam_dir, content_hint, created_by";
+const GAME_COLUMNS: &str = "id, name, modio_id, modio_slug, thunderstore, loader, steam_dir, content_hint, created_by, nexus";
 
 fn game_from(r: &Row) -> Game {
     Game {
@@ -347,6 +353,7 @@ fn game_from(r: &Row) -> Game {
             loader: r.get(5),
             steam_dir: r.get(6),
             content_hint: r.get(7),
+            nexus: r.get(9),
         },
         created_by: r.get(8),
     }
@@ -369,9 +376,9 @@ pub async fn game(db: &Client, id: i64) -> Result<Game, String> {
 async fn insert_game_on(db: &impl tokio_postgres::GenericClient, g: &NewGame, by: &str) -> Result<i64, String> {
     let row = db
         .query_one(
-            "INSERT INTO mm_games (name, modio_id, modio_slug, thunderstore, loader, steam_dir, content_hint, created_by)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id",
-            &[&g.name, &g.modio_id, &g.modio_slug, &g.thunderstore, &g.loader, &g.steam_dir, &g.content_hint, &by],
+            "INSERT INTO mm_games (name, modio_id, modio_slug, thunderstore, loader, steam_dir, content_hint, created_by, nexus)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id",
+            &[&g.name, &g.modio_id, &g.modio_slug, &g.thunderstore, &g.loader, &g.steam_dir, &g.content_hint, &by, &g.nexus],
         )
         .await
         .map_err(err)?;
@@ -384,8 +391,8 @@ pub async fn insert_game(db: &Client, g: &NewGame, by: &str) -> Result<i64, Stri
 
 pub async fn update_game(db: &Client, id: i64, g: &NewGame) -> Result<(), String> {
     db.execute(
-        "UPDATE mm_games SET name=$2, modio_id=$3, modio_slug=$4, thunderstore=$5, loader=$6, steam_dir=$7, content_hint=$8 WHERE id=$1",
-        &[&id, &g.name, &g.modio_id, &g.modio_slug, &g.thunderstore, &g.loader, &g.steam_dir, &g.content_hint],
+        "UPDATE mm_games SET name=$2, modio_id=$3, modio_slug=$4, thunderstore=$5, loader=$6, steam_dir=$7, content_hint=$8, nexus=$9 WHERE id=$1",
+        &[&id, &g.name, &g.modio_id, &g.modio_slug, &g.thunderstore, &g.loader, &g.steam_dir, &g.content_hint, &g.nexus],
     )
     .await
     .map_err(err)?;

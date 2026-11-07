@@ -31,8 +31,9 @@ const saving = ref(false);
 
 const isDirectLink = computed(() => {
   const s = link.value.trim();
-  return /^https?:\/\//.test(s) && !s.includes("mod.io/") && !s.includes("thunderstore.io");
+  return /^https?:\/\//.test(s) && !s.includes("mod.io/") && !s.includes("thunderstore.io") && !s.includes("nexusmods.com/");
 });
+const isNexus = computed(() => link.value.includes("nexusmods.com/"));
 
 const onList = computed(() => new Set((store.overview?.mods ?? []).map((m) => `${m.source}:${m.sourceId}`)));
 const already = computed(() => !!resolved.value && onList.value.has(`${resolved.value.main.source}:${resolved.value.main.sourceId}`));
@@ -64,7 +65,7 @@ async function resolve(input: string) {
   error.value = "";
   resolved.value = null;
   try {
-    resolved.value = await api.resolve(game.id, input, isDirectLink.value ? linkName.value : undefined, isDirectLink.value ? linkTarget.value : undefined);
+    resolved.value = await api.resolve(game.id, input, isDirectLink.value ? linkName.value : undefined, isDirectLink.value || isNexus.value ? linkTarget.value : undefined);
   } catch (e) {
     error.value = errorText(e);
   } finally {
@@ -170,12 +171,20 @@ async function add() {
       <template v-else>
         <div class="field">
           <label for="mm-link">Link</label>
-          <input id="mm-link" v-model="link" class="input" :placeholder="[hasModio && 'mod.io', game.thunderstore && 'Thunderstore'].filter(Boolean).join(' or ') + (hasModio || game.thunderstore ? ' page, or a direct download link' : 'A direct download link')" @keydown.enter="link.trim() && resolve(link)" />
+          <input id="mm-link" v-model="link" class="input" :placeholder="[hasModio && 'mod.io', game.thunderstore && 'Thunderstore', game.nexus && 'Nexus Mods'].filter(Boolean).join(', ') + (hasModio || game.thunderstore || game.nexus ? ' page, or a direct download link' : 'A direct download link')" @keydown.enter="link.trim() && resolve(link)" />
           <span class="hint">
             <template v-if="hasModio">mod.io: content mods. </template>
             <template v-if="game.thunderstore">Thunderstore ({{ game.thunderstore }}): {{ hasLoader ? `${loader} mods` : "mods" }}, with their dependencies. </template>
+            <template v-if="game.nexus">Nexus Mods: the newest main file, or the one in the link (…?tab=files&amp;file_id=…). </template>
             Any other link: the file is pinned by its checksum.
           </span>
+        </div>
+        <div v-if="isNexus && hasLoader" class="field">
+          <label>It's a</label>
+          <div class="choices">
+            <button class="choice" :class="{ on: linkTarget === 'content' }" @click="linkTarget = 'content'"><Box /> Content mod (mods folder)</button>
+            <button class="choice" :class="{ on: linkTarget === 'code' }" @click="linkTarget = 'code'"><Code2 /> {{ loader }} mod (game folder)</button>
+          </div>
         </div>
         <template v-if="isDirectLink">
           <div class="field">

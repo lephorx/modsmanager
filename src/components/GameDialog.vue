@@ -14,7 +14,7 @@ import { errorText, toast } from "@/lib/toast";
 const props = defineProps<{ game?: GameView; pathsOnly?: boolean }>();
 const emit = defineEmits<{ close: [] }>();
 
-const BLANK: NewGame = { name: "", modioId: 0, modioSlug: "", thunderstore: "", loader: "none", steamDir: "", contentHint: "" };
+const BLANK: NewGame = { name: "", modioId: 0, modioSlug: "", thunderstore: "", nexus: "", loader: "none", steamDir: "", contentHint: "" };
 const presets = ref<NewGame[]>([]);
 const step = ref<"pick" | "form">(props.game ? "form" : "pick");
 const g = ref<NewGame>(props.game ? { ...props.game } : { ...BLANK });
@@ -113,14 +113,14 @@ const LOADERS: { id: Loader; hint: string }[] = [
           <span class="icon"><Gamepad2 /></span>
           <span class="stack" style="gap: 2px; text-align: left">
             <strong>{{ p.name }}</strong>
-            <span class="hint">{{ [p.modioSlug && "mod.io", p.thunderstore && "Thunderstore"].filter(Boolean).join(" · ") }} · {{ LOADER_LABEL[p.loader] }}</span>
+            <span class="hint">{{ [p.modioSlug && "mod.io", p.thunderstore && "Thunderstore", p.nexus && "Nexus"].filter(Boolean).join(" · ") }} · {{ LOADER_LABEL[p.loader] }}</span>
           </span>
         </button>
         <button class="card card-hover option preset" @click="pick(null)">
           <span class="icon"><Box /></span>
           <span class="stack" style="gap: 2px; text-align: left">
             <strong>Another game</strong>
-            <span class="hint">Any game on mod.io or Thunderstore, or with mods from links</span>
+            <span class="hint">Any game on mod.io, Thunderstore or Nexus Mods, or with mods from links</span>
           </span>
         </button>
       </div>
@@ -144,6 +144,10 @@ const LOADERS: { id: Loader; hint: string }[] = [
             <label for="g-ts">Thunderstore community <span class="hint">(optional)</span></label>
             <input id="g-ts" v-model="g.thunderstore" class="input mono" placeholder="lethal-company or thunderstore.io/c/…" />
           </div>
+        </div>
+        <div class="field">
+          <label for="g-nexus">Nexus Mods game <span class="hint">(optional)</span></label>
+          <input id="g-nexus" v-model="g.nexus" class="input mono" placeholder="bladeandsorcery, as in nexusmods.com/bladeandsorcery" />
         </div>
         <div class="field">
           <label>Code mods</label>

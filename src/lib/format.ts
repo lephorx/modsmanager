@@ -25,7 +25,7 @@ export function count(n: number, one: string, many = `${one}s`): string {
   return `${n} ${n === 1 ? one : many}`;
 }
 
-export const SOURCE_LABEL: Record<string, string> = { modio: "mod.io", thunderstore: "Thunderstore", link: "Link" };
+export const SOURCE_LABEL: Record<string, string> = { modio: "mod.io", thunderstore: "Thunderstore", nexus: "Nexus Mods", link: "Link" };
 
 /** A thumbnail that fails to load leaves the icon under it showing. */
 export function hideImg(e: Event) {

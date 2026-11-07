@@ -3,6 +3,7 @@
 
 pub mod link;
 pub mod modio;
+pub mod nexus;
 pub mod thunderstore;
 
 use std::collections::HashSet;
@@ -18,6 +19,8 @@ pub struct Ctx<'a> {
     pub temp: &'a std::path::Path,
     /// The game whose list this is for.
     pub game: &'a Game,
+    /// One-time Nexus download keys from `nxm://` links.
+    pub nxm: &'a nexus::NxmKeys,
 }
 
 impl Ctx<'_> {
@@ -69,6 +72,8 @@ pub fn kind_of(input: &str) -> &'static str {
     let s = input.trim();
     if s.is_empty() {
         "unknown"
+    } else if s.contains("nexusmods.com/") {
+        "nexus"
     } else if s.contains("mod.io/") || s.chars().all(|c| c.is_ascii_digit()) {
         "modio"
     } else if s.contains("thunderstore.io") || (!s.contains("://") && !s.contains(' ') && s.contains('-')) {
@@ -104,8 +109,9 @@ pub async fn resolve(ctx: &Ctx<'_>, input: &str, opts: &AddOptions) -> Result<Re
             }
             Ok(Resolved { main, deps: out })
         }
+        "nexus" => Ok(Resolved { main: nexus::resolve(ctx, input, &opts.target).await?, deps: vec![] }),
         "link" => Ok(Resolved { main: link::resolve(ctx, input, opts).await?, deps: vec![] }),
-        _ => Err("Paste a mod.io or Thunderstore link, a mod.io id, or a direct download link".into()),
+        _ => Err("Paste a mod.io, Thunderstore or Nexus Mods link, a mod.io id, or a direct download link".into()),
     }
 }
 
@@ -115,6 +121,7 @@ pub async fn latest(ctx: &Ctx<'_>, m: &NewMod, deep: bool) -> Result<Option<NewM
     match m.source.as_str() {
         "modio" => modio::latest(ctx, m).await,
         "thunderstore" => thunderstore::latest(ctx, m).await,
+        "nexus" => nexus::latest(ctx, m).await,
         "link" if deep => link::latest(ctx, m).await,
         _ => Ok(None),
     }
@@ -124,6 +131,7 @@ pub async fn fetch(ctx: &Ctx<'_>, m: &NewMod) -> Result<Fetch, String> {
     match m.source.as_str() {
         "modio" => modio::fetch(ctx, m).await,
         "thunderstore" => Ok(thunderstore::fetch(ctx, m)),
+        "nexus" => nexus::fetch(ctx, m).await,
         "link" => Ok(link::fetch(ctx, m)),
         other => Err(format!("Unknown source {other}")),
     }
