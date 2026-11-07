@@ -38,7 +38,5 @@ dirs = "6"
 winreg = "0.55"
 
 [profile.release]
-codegen-units = 1
-lto = true
-opt-level = "s"
+# fast to build: no LTO and parallel codegen (full LTO took ~6 minutes in CI for a few MB less)
 strip = true

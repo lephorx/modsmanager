@@ -22,9 +22,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+          # reuse the release build's dependencies from the previous release
+          shared-key: release
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
-      - run: cargo test --manifest-path src-tauri/Cargo.toml
+      # tests already ran in CI on the push to main
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
