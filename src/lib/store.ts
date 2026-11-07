@@ -107,7 +107,7 @@ export async function runSync(quiet = false) {
 }
 
 /** A batch of jobs ran out: say how it went, then refresh the list. */
-let batch = { done: 0, failed: 0 };
+let batch = { done: 0, failed: 0, cancelled: 0 };
 let wasActive = false;
 let refreshTimer: ReturnType<typeof setTimeout> | undefined;
 function onQueue(jobs: Job[]) {
@@ -117,6 +117,7 @@ function onQueue(jobs: Job[]) {
     const was = before.get(j.id);
     if (was === j.status) continue;
     if (j.status === "done") batch.done++;
+    if (j.status === "cancelled") batch.cancelled++;
     if (j.status === "failed") {
       batch.failed++;
       toast.error(`${j.name}: ${j.error ?? "failed"}`);
@@ -130,9 +131,10 @@ function onQueue(jobs: Job[]) {
     refreshTimer = setTimeout(() => void refresh(), 400);
   }
   if (wasActive && !active) {
-    if (batch.done && !batch.failed) toast.success(batch.done === 1 ? "1 change installed" : `${batch.done} changes installed`);
-    else if (batch.done && batch.failed) toast.info(`${batch.done} installed, ${batch.failed} failed (see Downloads)`);
-    batch = { done: 0, failed: 0 };
+    const parts = [batch.done && `${batch.done} installed`, batch.failed && `${batch.failed} failed`, batch.cancelled && `${batch.cancelled} cancelled`].filter(Boolean);
+    if (batch.done && !batch.failed && !batch.cancelled) toast.success(batch.done === 1 ? "1 change installed" : `${batch.done} changes installed`);
+    else if (parts.length) toast.info(`${parts.join(", ")}${batch.failed ? " (see Downloads)" : ""}`);
+    batch = { done: 0, failed: 0, cancelled: 0 };
   }
   wasActive = active;
   if (store.nexusAssist) followNexus();

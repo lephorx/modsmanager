@@ -11,7 +11,7 @@ Keeps everyone's mods **identical**: same mods, same exact files, for any game a
 - **People**: everyone who joined, online or not, and whether they're in sync in the game you're looking at.
 - **Invite codes**: one paste sets up someone's app (database and game). The database address, API key, token and invite codes are hidden fields.
 - **Activity** shows who changed what, and when. Files in a game's folders that aren't on its list get flagged so you can delete or keep them.
-- **Install queue**: Sync, new mods, auto-sync and Nexus clicks all go into one queue; 3 downloads at a time, each with its own progress. The Downloads panel shows what's running, waiting for a Nexus click, queued, done or failed (retry, cancel, clear).
+- **Install queue**: Sync, new mods, auto-sync and Nexus clicks all go into one queue; 3 downloads at a time, each with its own progress. The Downloads panel shows what's running, waiting for a Nexus click, queued, done or failed. Cancel any download (installed files stay untouched until the new one is complete), cancel all, retry, and drag queued items or use the arrows to choose what downloads next.
 - Updates itself from GitHub releases.
 
 Built with Tauri 2 (Rust) and Vue 3, in Tessera Launcher's design (Modern and Classic looks). Windows only for now.

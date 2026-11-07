@@ -150,7 +150,7 @@ export interface Unmanaged {
   isDir: boolean;
 }
 
-export type JobStatus = "queued" | "downloading" | "installing" | "removing" | "done" | "failed" | "waiting";
+export type JobStatus = "queued" | "downloading" | "installing" | "removing" | "done" | "failed" | "cancelled" | "waiting";
 
 /** One install, update or removal in the queue. */
 export interface Job {
@@ -207,7 +207,9 @@ export const api = {
   queueSync: (game: number) => invoke<number>("queue_sync", { game }),
   queue: () => invoke<Job[]>("queue_list"),
   queueCancel: (id: number) => invoke<void>("queue_cancel", { id }),
+  queueCancelAll: () => invoke<number>("queue_cancel_all"),
   queueRetry: (id: number) => invoke<void>("queue_retry", { id }),
+  queueReorder: (order: number[]) => invoke<void>("queue_reorder", { order }),
   queueClear: () => invoke<void>("queue_clear"),
   unmanaged: (game: number) => invoke<Unmanaged[]>("unmanaged", { game }),
   deleteUnmanaged: (game: number, keys: string[]) => invoke<void>("delete_unmanaged", { game, keys }),

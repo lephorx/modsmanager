@@ -45,8 +45,15 @@ fn disposition_name(resp: &reqwest::Response) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
+/// What a download stopped by `cancelled` returns.
+pub const CANCELLED: &str = "Cancelled";
+
 /// Streams the file to `dest`, reporting `(done, total)`, and checks it against the expected hash.
-pub async fn download(fetch: Fetch, dest: &Path, mut progress: impl FnMut(u64, u64)) -> Result<Downloaded, String> {
+/// Stops (with `CANCELLED`) as soon as `cancelled()` says so; the caller deletes the partial file.
+pub async fn download(fetch: Fetch, dest: &Path, mut progress: impl FnMut(u64, u64), cancelled: impl Fn() -> bool) -> Result<Downloaded, String> {
+    if cancelled() {
+        return Err(CANCELLED.into());
+    }
     let resp = fetch.request.send().await.map_err(|e| format!("Download failed: {}", e.without_url()))?;
     let resp = check(resp, "Download failed").await?;
     let total = resp.content_length().unwrap_or(0);
@@ -59,6 +66,9 @@ pub async fn download(fetch: Fetch, dest: &Path, mut progress: impl FnMut(u64, u
     let mut done = 0u64;
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
+        if cancelled() {
+            return Err(CANCELLED.into());
+        }
         let chunk = chunk.map_err(|e| format!("Download interrupted: {}", e.without_url()))?;
         md5.update(&chunk);
         sha.update(&chunk);

@@ -16,7 +16,7 @@ fn file_name_of(link: &str) -> String {
 async fn pin(ctx: &Ctx<'_>, link: &str) -> Result<install::Downloaded, String> {
     let fetch = Fetch { request: ctx.http.get(link), file_name: file_name_of(link), md5: None, sha256: None };
     let dest = ctx.temp.join(format!("pin-{}-{}", std::process::id(), chrono::Utc::now().timestamp_millis()));
-    let got = install::download(fetch, &dest, |_, _| {}).await;
+    let got = install::download(fetch, &dest, |_, _| {}, || false).await;
     let _ = tokio::fs::remove_file(&dest).await;
     got
 }

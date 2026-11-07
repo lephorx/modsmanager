@@ -653,7 +653,7 @@ pub struct Job {
     name: String,
     /// install | update | repair | remove
     action: &'static str,
-    /// queued | downloading | installing | removing | done | failed | waiting
+    /// queued | downloading | installing | removing | done | failed | cancelled | waiting
     status: &'static str,
     done: u64,
     total: u64,
@@ -669,7 +669,7 @@ impl Job {
         matches!(self.status, "queued" | "downloading" | "installing" | "removing")
     }
     fn finished(&self) -> bool {
-        matches!(self.status, "done" | "failed")
+        matches!(self.status, "done" | "failed" | "cancelled")
     }
 }
 
@@ -679,6 +679,8 @@ pub struct Queue {
     next_id: std::sync::atomic::AtomicU64,
     /// A worker is draining the queue.
     working: AtomicBool,
+    /// Running downloads asked to stop.
+    cancel: std::sync::Mutex<std::collections::HashSet<u64>>,
 }
 
 /// How the queue tells the window (or a test) that it changed.
@@ -696,6 +698,37 @@ impl Queue {
     fn get(&self, id: u64) -> Option<Job> {
         self.jobs.lock().unwrap().iter().find(|j| j.id == id).cloned()
     }
+    fn reorder(&self, order: &[u64]) {
+        let mut jobs = self.jobs.lock().unwrap();
+        let slots: Vec<usize> = jobs.iter().enumerate().filter(|(_, j)| j.status == "queued").map(|(i, _)| i).collect();
+        let mut queued: Vec<Job> = slots.iter().map(|&i| jobs[i].clone()).collect();
+        let rank = |j: &Job| order.iter().position(|id| *id == j.id).unwrap_or(usize::MAX);
+        queued.sort_by_key(rank); // stable: unlisted jobs keep their order, after the listed ones
+        for (slot, job) in slots.into_iter().zip(queued) {
+            jobs[slot] = job;
+        }
+    }
+
+    fn is_cancelled(&self, id: u64) -> bool {
+        self.cancel.lock().unwrap().contains(&id)
+    }
+
+    /// Stops a job: one that hasn't started (or waits for its Nexus click) leaves the queue,
+    /// a download stops at its next chunk. Installing and removing finish (seconds), so a mod is
+    /// never left half-installed.
+    fn cancel(&self, id: u64) -> R<()> {
+        let mut jobs = self.jobs.lock().unwrap();
+        let Some(j) = jobs.iter().find(|j| j.id == id) else { return Ok(()) };
+        match j.status {
+            "queued" | "waiting" => jobs.retain(|j| j.id != id),
+            "downloading" => {
+                self.cancel.lock().unwrap().insert(id);
+            }
+            "installing" | "removing" => return Err(format!("{} is almost done and can't be stopped now", j.name)),
+            _ => {}
+        }
+        Ok(())
+    }
 }
 
 /// The folder a code mod gets for itself (BepInEx plugins): Thunderstore's `Namespace-Name`.
@@ -711,6 +744,7 @@ fn package_name(m: &NewMod) -> String {
 #[allow(clippy::too_many_arguments)]
 async fn install_one(
     progress: &(dyn Fn(&'static str, u64, u64) + Send + Sync),
+    cancelled: &(dyn Fn() -> bool + Send + Sync),
     state: &AppState,
     settings: &Settings,
     game: &Game,
@@ -730,12 +764,17 @@ async fn install_one(
     let file = state.temp.join(format!("dl-{}", m.id));
     let staging = state.temp.join(format!("unpack-{}", m.id));
     let mut last = Instant::now() - Duration::from_secs(1);
-    let got = install::download(fetch, &file, |done, total| {
-        if last.elapsed() >= Duration::from_millis(150) || done == total {
-            last = Instant::now();
-            progress("downloading", done, total);
-        }
-    })
+    let got = install::download(
+        fetch,
+        &file,
+        |done, total| {
+            if last.elapsed() >= Duration::from_millis(150) || done == total {
+                last = Instant::now();
+                progress("downloading", done, total);
+            }
+        },
+        cancelled,
+    )
     .await;
     let got = match got {
         Ok(g) => g,
@@ -822,6 +861,11 @@ async fn enqueue(state: &AppState, game: i64) -> R<usize> {
 
 /// Runs one job to its end.
 async fn run_job(state: &AppState, id: u64, emit: &QueueEmit) {
+    run_job_inner(state, id, emit).await;
+    state.queue.cancel.lock().unwrap().remove(&id);
+}
+
+async fn run_job_inner(state: &AppState, id: u64, emit: &QueueEmit) {
     let Some(job) = state.queue.get(id) else { return };
     let report = |f: &dyn Fn(&mut Job)| {
         state.queue.update(id, |j| f(j));
@@ -855,7 +899,8 @@ async fn run_job(state: &AppState, id: u64, emit: &QueueEmit) {
                 }
             })
         };
-        install_one(&progress, state, &settings, &g, &paths, &m, old).await.map(|i| Some(Some(i)))
+        let cancelled = || state.queue.is_cancelled(id);
+        install_one(&progress, &cancelled, state, &settings, &g, &paths, &m, old).await.map(|i| Some(Some(i)))
     }
     .await;
     match outcome {
@@ -885,6 +930,10 @@ async fn run_job(state: &AppState, id: u64, emit: &QueueEmit) {
                 }
             });
         }
+        Err(e) if e == install::CANCELLED => report(&|j| {
+            j.status = "cancelled";
+            j.done = 0;
+        }),
         Err(e) => match e.strip_prefix(nexus::NEEDS_CLICK) {
             Some(page) => {
                 let page = page.to_string();
@@ -902,27 +951,32 @@ async fn run_job(state: &AppState, id: u64, emit: &QueueEmit) {
     }
 }
 
-/// Works through the queue until nothing is queued, `PARALLEL` jobs at a time; then tells the
-/// others where this computer stands in each game it touched.
+/// Takes the next queued job (the queue's order is the download order) and marks it started.
+fn start_next(queue: &Queue, touched: &mut Vec<i64>) -> Option<u64> {
+    let mut jobs = queue.jobs.lock().unwrap();
+    let j = jobs.iter_mut().find(|j| j.status == "queued")?;
+    j.status = if j.action == "remove" { "removing" } else { "downloading" };
+    if !touched.contains(&j.game) {
+        touched.push(j.game);
+    }
+    Some(j.id)
+}
+
+/// Works through the queue until nothing is queued, up to `PARALLEL` jobs at a time (a slot that
+/// frees up takes the next job right away); then tells the others where this computer stands in
+/// each game it touched.
 async fn drain(state: &AppState, emit: &QueueEmit) {
     let mut touched: Vec<i64> = Vec::new();
+    let mut running = futures_util::stream::FuturesUnordered::new();
     loop {
-        let batch: Vec<u64> = {
-            let mut jobs = state.queue.jobs.lock().unwrap();
-            let ids: Vec<u64> = jobs.iter().filter(|j| j.status == "queued").take(PARALLEL).map(|j| j.id).collect();
-            for j in jobs.iter_mut().filter(|j| ids.contains(&j.id)) {
-                j.status = if j.action == "remove" { "removing" } else { "downloading" };
-                if !touched.contains(&j.game) {
-                    touched.push(j.game);
-                }
-            }
-            ids
-        };
-        if batch.is_empty() {
+        while running.len() < PARALLEL {
+            let Some(id) = start_next(&state.queue, &mut touched) else { break };
+            emit(state.queue.snapshot());
+            running.push(run_job(state, id, emit));
+        }
+        if running.next().await.is_none() {
             break;
         }
-        emit(state.queue.snapshot());
-        futures_util::future::join_all(batch.into_iter().map(|id| run_job(state, id, emit))).await;
     }
     let me = state.me().await;
     if me.is_empty() {
@@ -977,17 +1031,35 @@ fn queue_list(state: State<'_, AppState>) -> Vec<Job> {
     state.queue.snapshot()
 }
 
-/// Takes a job that hasn't started (or waits for its Nexus click) off the queue.
+/// Stops a job (see `Queue::cancel`).
 #[tauri::command]
-fn queue_cancel(app: AppHandle, state: State<'_, AppState>, id: u64) {
-    state.queue.jobs.lock().unwrap().retain(|j| j.id != id || !(j.status == "queued" || j.status == "waiting"));
+fn queue_cancel(app: AppHandle, state: State<'_, AppState>, id: u64) -> R<()> {
+    let r = state.queue.cancel(id);
+    let _ = app.emit("queue", state.queue.snapshot());
+    r
+}
+
+/// Stops everything that can be stopped; returns how many.
+#[tauri::command]
+fn queue_cancel_all(app: AppHandle, state: State<'_, AppState>) -> usize {
+    let ids: Vec<u64> = state.queue.snapshot().into_iter().filter(|j| matches!(j.status, "queued" | "waiting" | "downloading")).map(|j| j.id).collect();
+    let n = ids.iter().filter(|id| state.queue.cancel(**id).is_ok()).count();
+    let _ = app.emit("queue", state.queue.snapshot());
+    n
+}
+
+/// Puts the queued jobs in this order (the order they download in). Jobs that already run or
+/// finished keep their place; queued jobs missing from `order` go after the ones listed.
+#[tauri::command]
+fn queue_reorder(app: AppHandle, state: State<'_, AppState>, order: Vec<u64>) {
+    state.queue.reorder(&order);
     let _ = app.emit("queue", state.queue.snapshot());
 }
 
 #[tauri::command]
 fn queue_retry(app: AppHandle, state: State<'_, AppState>, id: u64) {
     state.queue.update(id, |j| {
-        if j.status == "failed" {
+        if j.status == "failed" || j.status == "cancelled" {
             j.status = "queued";
             j.error = None;
             j.done = 0;
@@ -1214,7 +1286,9 @@ pub fn run() {
             queue_sync,
             queue_list,
             queue_cancel,
+            queue_cancel_all,
             queue_retry,
+            queue_reorder,
             queue_clear,
             unmanaged,
             delete_unmanaged,
@@ -1447,6 +1521,32 @@ mod e2e {
             db::insert_mod(&db, lethal, m, "cedric").await.unwrap();
         }
 
+        // cancelling: a download stops mid-stream…
+        let fusion = sources::fetch(&ctx, &older).await.unwrap();
+        let started = AtomicBool::new(false);
+        let partial = ramon.temp.join("cancel-test");
+        let r = install::download(fusion, &partial, |_, _| started.store(true, Ordering::SeqCst), || started.load(Ordering::SeqCst)).await;
+        assert_eq!(r.err().as_deref(), Some(install::CANCELLED), "stops after the first chunk");
+        let _ = std::fs::remove_file(&partial);
+        // …and cancelled jobs install nothing; the next sync queues them again
+        enqueue(&ramon, lethal).await.unwrap();
+        let ids: Vec<u64> = ramon.queue.snapshot().iter().map(|j| j.id).collect();
+        assert!(ids.len() >= 2);
+        // the first one is still queued: it just leaves the queue
+        ramon.queue.cancel(ids[0]).unwrap();
+        assert!(ramon.queue.get(ids[0]).is_none());
+        // the others as if they were already downloading
+        ramon.queue.jobs.lock().unwrap().iter_mut().for_each(|j| j.status = "downloading");
+        for id in &ids[1..] {
+            ramon.queue.cancel(*id).unwrap();
+        }
+        ramon.queue.jobs.lock().unwrap().iter_mut().for_each(|j| j.status = "queued");
+        drain(&ramon, &|_| {}).await;
+        assert!(ramon.queue.snapshot().iter().all(|j| j.status == "cancelled"), "{:?}", ramon.queue.snapshot().iter().map(|j| j.status).collect::<Vec<_>>());
+        assert!(ramon.local.lock().await.game(lethal).installed.is_empty(), "nothing installed");
+        assert!(ramon.queue.cancel.lock().unwrap().is_empty(), "cancel requests are cleared");
+        ramon.queue.jobs.lock().unwrap().clear();
+
         // all three sync both games
         for c in [&ramon, &cedric, &alex] {
             assert_eq!(sync(c, bonelab).await, vec!["install"]);
@@ -1484,6 +1584,34 @@ mod e2e {
         db::delete_game(&db, lethal).await.unwrap();
         assert!(db::list_mods(&db, lethal).await.unwrap().is_empty());
         assert_eq!(db::games(&db).await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn reordering_moves_only_queued_jobs() {
+        let q = Queue::default();
+        let job = |id: u64, status: &'static str| Job {
+            id,
+            game: 1,
+            game_name: "G".into(),
+            key: format!("k{id}"),
+            mod_id: Some(id as i64),
+            name: format!("m{id}"),
+            action: "install",
+            status,
+            done: 0,
+            total: 0,
+            error: None,
+            manual_url: None,
+            nexus: None,
+        };
+        *q.jobs.lock().unwrap() = vec![job(1, "done"), job(2, "queued"), job(3, "downloading"), job(4, "queued"), job(5, "queued")];
+        q.reorder(&[5, 2]);
+        let ids: Vec<u64> = q.snapshot().iter().map(|j| j.id).collect();
+        // 5 first, then 2, then 4 (not listed); 1 and 3 stay where they were
+        assert_eq!(ids, vec![1, 5, 3, 2, 4]);
+        let mut touched = Vec::new();
+        assert_eq!(start_next(&q, &mut touched), Some(5));
+        assert_eq!(q.get(5).unwrap().status, "downloading");
     }
 
     #[test]

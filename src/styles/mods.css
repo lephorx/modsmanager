@@ -653,3 +653,60 @@ html[data-design="modern"] .queue-progress > span {
 .dialog-body > .btn + .section-title.dialog-section {
   margin-top: 0;
 }
+
+.queue-job[data-status="cancelled"] .queue-icon {
+  color: var(--muted-foreground);
+}
+.queue-job[data-status="cancelled"] strong {
+  color: var(--muted-foreground);
+}
+
+/* moving queued jobs */
+.queue-head .hint {
+  white-space: nowrap;
+}
+.queue-job[draggable="true"] {
+  cursor: grab;
+}
+.queue-job.dragging {
+  opacity: 0.45;
+}
+.queue-job.drop-before {
+  box-shadow: inset 0 2px 0 var(--primary);
+}
+.queue-job.drop-after {
+  box-shadow: inset 0 -2px 0 var(--primary);
+}
+.queue-grip {
+  display: grid;
+  place-items: center;
+  width: 14px;
+  margin-left: -8px;
+  margin-right: -4px;
+  color: var(--muted-foreground);
+  opacity: 0.6;
+}
+.queue-grip svg {
+  width: 14px;
+  height: 14px;
+}
+.queue-job:hover .queue-grip {
+  opacity: 1;
+}
+.queue-move {
+  display: flex;
+  flex-shrink: 0;
+}
+.queue-move .btn-icon {
+  width: 26px;
+  height: 26px;
+}
+.queue-move .btn-icon svg {
+  width: 14px;
+  height: 14px;
+}
+.queue-group-hint {
+  font-weight: 500;
+  letter-spacing: 0;
+  text-transform: none;
+}

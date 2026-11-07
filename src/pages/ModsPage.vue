@@ -226,7 +226,10 @@ function added(m: ModView) {
             <template v-else>Someone changed the list, or something here doesn't match it.<template v-if="planSize"> About {{ bytes(planSize) }} to download.</template></template>
           </span>
         </div>
-        <button v-if="installing" class="btn btn-lg" @click="store.queueOpen = true"><ListChecks /> Downloads</button>
+        <template v-if="installing">
+          <button class="btn btn-lg btn-ghost" @click="api.queueCancelAll().catch((e) => toast.error(errorText(e)))">Cancel</button>
+          <button class="btn btn-lg" @click="store.queueOpen = true"><ListChecks /> Downloads</button>
+        </template>
         <button v-else-if="automatic.length" class="btn btn-play btn-lg" @click="runSync()"><Download /> Sync now</button>
         <button v-else-if="manual.length && !store.nexusAssist" class="btn btn-primary btn-lg" @click="nextFromNexus()"><ExternalLink /> Get from Nexus</button>
       </div>
