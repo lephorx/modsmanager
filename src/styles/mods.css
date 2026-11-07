@@ -281,13 +281,27 @@ html[data-design="modern"] .mod-thumb.lg {
 .hit {
   display: flex;
   align-items: center;
+  gap: 8px;
+  padding: 4px 8px 4px 4px;
+}
+.hit-main {
+  display: flex;
+  flex: 1;
+  align-items: center;
   gap: 12px;
-  padding: 8px;
+  min-width: 0;
+  padding: 4px;
   border: 0;
   background: none;
   color: inherit;
   font: inherit;
   cursor: pointer;
+}
+.chip-added {
+  color: var(--status-green);
+}
+.chip-error {
+  color: var(--destructive);
 }
 .hit:hover {
   background: var(--fill);

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from "vue";
-import { ArrowLeft, Box, Code2, Download, Link2, Loader2, Plus, Search } from "lucide-vue-next";
+import { ArrowLeft, Box, Check, Code2, Download, Link2, Loader2, Plus, Search } from "lucide-vue-next";
 import AppDialog from "./AppDialog.vue";
 import { api, LOADER_LABEL, type Resolved, type SearchHit, type Target } from "@/lib/api";
 import { refresh, runSync, store } from "@/lib/store";
@@ -70,6 +70,27 @@ async function resolve(input: string) {
     error.value = errorText(e);
   } finally {
     resolving.value = false;
+  }
+}
+
+/** Search results added straight from the list: their state, by mod.io id. */
+const quick = ref<Record<string, "adding" | "added" | "error">>({});
+const quickError = ref<Record<string, string>>({});
+
+/** The download button: pins the newest file and adds it for everyone, then queues its install. */
+async function quickAdd(h: SearchHit) {
+  quick.value[h.id] = "adding";
+  try {
+    const r = await api.resolve(game.id, h.input);
+    await api.add(game.id, [r.main, ...r.deps.filter((d) => !onList.value.has(`${d.source}:${d.sourceId}`))]);
+    quick.value[h.id] = "added";
+    toast.success(`${r.main.name} added for everyone`);
+    await refresh();
+    void runSync(true);
+  } catch (e) {
+    quick.value[h.id] = "error";
+    quickError.value[h.id] = errorText(e);
+    toast.error(`${h.name}: ${errorText(e)}`);
   }
 }
 
@@ -155,15 +176,28 @@ async function add() {
         <p v-if="searchError" class="error-text selectable">{{ searchError }}</p>
         <div class="hits">
           <div v-if="searching && !hits.length" class="row hint" style="gap: 8px; padding: 12px"><Loader2 class="spin" /> Searching…</div>
-          <button v-for="h in hits" :key="h.input" class="hit" @click="resolve(h.input)">
-            <span class="mod-thumb"><Box /><img v-if="h.thumb" :src="h.thumb" alt="" loading="lazy" @error="hideImg" /></span>
-            <span class="stack" style="gap: 2px; min-width: 0; flex: 1; text-align: left">
-              <strong class="ellipsis">{{ h.name }}</strong>
-              <span class="hint ellipsis">by {{ h.author }} · {{ h.downloads.toLocaleString() }} downloads</span>
-            </span>
-            <span v-if="onList.has(`modio:${h.id}`)" class="chip">On the list</span>
-            <Download :size="16" class="muted" />
-          </button>
+          <div v-for="h in hits" :key="h.input" class="hit">
+            <!-- the name opens the details; the download button adds it for everyone right away -->
+            <button class="hit-main" :title="`Details of ${h.name}`" @click="resolve(h.input)">
+              <span class="mod-thumb"><Box /><img v-if="h.thumb" :src="h.thumb" alt="" loading="lazy" @error="hideImg" /></span>
+              <span class="stack" style="gap: 2px; min-width: 0; flex: 1; text-align: left">
+                <strong class="ellipsis">{{ h.name }}</strong>
+                <span class="hint ellipsis">by {{ h.author }} · {{ h.downloads.toLocaleString() }} downloads</span>
+              </span>
+            </button>
+            <span v-if="quick[h.id] === 'error'" class="chip chip-error" :title="quickError[h.id]">Failed</span>
+            <span v-else-if="onList.has(`modio:${h.id}`) || quick[h.id] === 'added'" class="chip chip-added"><Check :size="14" /> {{ quick[h.id] === "added" ? "Added" : "On the list" }}</span>
+            <button
+              v-if="!onList.has(`modio:${h.id}`) && quick[h.id] !== 'added'"
+              class="btn btn-sm btn-ghost btn-icon"
+              :disabled="quick[h.id] === 'adding'"
+              :title="`Add ${h.name} for everyone and install it`"
+              :aria-label="`Add ${h.name} for everyone`"
+              @click="quickAdd(h)"
+            >
+              <Loader2 v-if="quick[h.id] === 'adding'" class="spin" :size="16" /><Download v-else :size="16" />
+            </button>
+          </div>
           <p v-if="!searching && !hits.length && !searchError" class="hint" style="padding: 12px">No mods found.</p>
         </div>
       </template>
