@@ -13,14 +13,17 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      # make the release first: if GitHub refuses, this fails in seconds instead of after the build
-      - name: Create the release
+      # a draft first: if GitHub refuses, this fails in seconds instead of after the build, and
+      # installed apps keep seeing the previous release (with its latest.json) until this one is complete
+      - name: Create the release (draft)
+        id: release
         if: github.ref_type == 'tag'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --verify-tag --title "Mods Manager $GITHUB_REF_NAME" --notes-from-tag
+          gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --draft --verify-tag --title "Mods Manager $GITHUB_REF_NAME" --notes-from-tag
+          echo "id=$(gh api "repos/$GITHUB_REPOSITORY/releases" --jq ".[] | select(.tag_name == \"$GITHUB_REF_NAME\") | .id" | head -1)" >> "$GITHUB_OUTPUT"
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
@@ -42,6 +45,20 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
-          releaseDraft: false
+          releaseId: ${{ steps.release.outputs.id }}
           includeUpdaterJson: true
+      # everything is uploaded: now installed apps may see it
+      - name: Publish the release
+        if: github.ref_type == 'tag'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false --latest
+      # the updater file must point at the published files (not a draft's temporary links)
+      - name: Check the update file
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          json=$(curl -fsSL "https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/latest.json")
+          echo "$json"
+          echo "$json" | grep -q "/releases/download/$GITHUB_REF_NAME/" || { echo "latest.json doesn't point at $GITHUB_REF_NAME"; exit 1; }
