@@ -18,10 +18,11 @@ import {
   Box,
   Gamepad2,
   FolderCog,
+  ListChecks,
   UserPlus,
 } from "lucide-vue-next";
-import { api, LOADER_LABEL, type Action, type ModView } from "@/lib/api";
-import { checkUpdates, currentGame, hasPaths, nextFromNexus, nexusPending, refresh, runSync, stopNexus, store } from "@/lib/store";
+import { api, isActive, LOADER_LABEL, type Action, type Job, type ModView } from "@/lib/api";
+import { checkUpdates, currentGame, gameJobs, hasPaths, nextFromNexus, nexusPending, refresh, runSync, stopNexus, store } from "@/lib/store";
 import { gameDialog } from "@/lib/dialogs";
 import { ago, hideImg, bytes, count, SOURCE_LABEL } from "@/lib/format";
 import { errorText, toast } from "@/lib/toast";
@@ -80,19 +81,30 @@ const STATE: Record<ModView["state"], { label: string; state: string }> = {
   broken: { label: "Files missing", state: "error" },
 };
 
-const percent = computed(() => {
-  const p = store.progress;
-  if (!p || !p.count) return 0;
-  const inner = p.phase === "downloading" && p.total ? p.done / p.total : p.phase === "installing" ? 0.95 : 0;
-  return Math.round(((p.index + inner) / p.count) * 100);
+/** This game's jobs in the current run of the queue (from the oldest one still going). */
+const run = computed(() => {
+  const jobs = gameJobs();
+  const active = jobs.filter(isActive);
+  if (!active.length) return [];
+  const from = Math.min(...active.map((j) => j.id));
+  return jobs.filter((j) => j.id >= from && j.status !== "waiting");
 });
+const installing = computed(() => run.value.some(isActive));
+
+function share(j: Job) {
+  if (j.status === "done" || j.status === "failed") return 1;
+  if (j.status === "downloading") return j.total ? (j.done / j.total) * 0.9 : 0.05;
+  if (j.status === "installing") return 0.95;
+  if (j.status === "removing") return 0.5;
+  return 0;
+}
+const percent = computed(() => (run.value.length ? Math.round((run.value.reduce((n, j) => n + share(j), 0) / run.value.length) * 100) : 0));
 
 const phaseText = computed(() => {
-  const p = store.progress;
-  if (!p) return "Starting…";
-  if (p.phase === "downloading") return `Downloading ${p.name}${p.total ? ` · ${bytes(p.done)} of ${bytes(p.total)}` : ""}`;
-  if (p.phase === "installing") return `Installing ${p.name}`;
-  return `Removing ${p.name}`;
+  const going = run.value.filter((j) => j.status === "downloading" || j.status === "installing" || j.status === "removing");
+  const left = run.value.filter(isActive).length;
+  const now = going.map((j) => (j.status === "downloading" ? `${j.name}${j.total ? ` (${Math.round((j.done / j.total) * 100)}%)` : ""}` : `${j.name} (${j.status})`));
+  return `${left} left${now.length ? ` · ${now.join(", ")}` : ""}`;
 });
 
 async function updateMod(m: ModView) {
@@ -103,7 +115,7 @@ async function updateMod(m: ModView) {
       toast.success(`${m.name} now pinned to ${v} for everyone`);
       delete store.updates[m.id];
       await refresh();
-      if (store.overview?.plan.length) void runSync();
+      if (store.overview?.plan.length) void runSync(true);
     } else toast.info(`${m.name} is already on its newest file`);
   } catch (e) {
     toast.error(errorText(e));
@@ -125,7 +137,7 @@ async function removeMod(m: ModView) {
     await api.remove(m.id);
     toast.success(`${m.name} is off the list`);
     await refresh();
-    void runSync();
+    void runSync(true);
   } catch (e) {
     toast.error(errorText(e));
   }
@@ -204,24 +216,22 @@ function added(m: ModView) {
     </section>
 
     <!-- what this computer has to do to match the list -->
-    <section v-else-if="store.syncing || plan.length" class="card sync-card">
+    <section v-else-if="installing || plan.length" class="card sync-card">
       <div class="row" style="gap: 14px; align-items: flex-start">
-        <span class="sync-icon"><Download v-if="!store.syncing" /><Loader2 v-else class="spin" /></span>
+        <span class="sync-icon"><Download v-if="!installing" /><Loader2 v-else class="spin" /></span>
         <div class="stack" style="gap: 2px; flex: 1; min-width: 0">
-          <h2 class="card-title">{{ store.syncing ? "Syncing…" : `${count(plan.length, "change")} to match the list` }}</h2>
+          <h2 class="card-title">{{ installing ? `Installing… ${percent}%` : `${count(plan.length, "change")} to match the list` }}</h2>
           <span class="hint">
-            <template v-if="store.syncing">{{ phaseText }}</template>
+            <template v-if="installing">{{ phaseText }}</template>
             <template v-else>Someone changed the list, or something here doesn't match it.<template v-if="planSize"> About {{ bytes(planSize) }} to download.</template></template>
           </span>
         </div>
-        <button v-if="automatic.length || store.syncing" class="btn btn-play btn-lg" :disabled="store.syncing" @click="runSync()">
-          <Loader2 v-if="store.syncing" class="spin" /><Download v-else />
-          {{ store.syncing ? `${percent}%` : "Sync now" }}
-        </button>
+        <button v-if="installing" class="btn btn-lg" @click="store.queueOpen = true"><ListChecks /> Downloads</button>
+        <button v-else-if="automatic.length" class="btn btn-play btn-lg" @click="runSync()"><Download /> Sync now</button>
         <button v-else-if="manual.length && !store.nexusAssist" class="btn btn-primary btn-lg" @click="nextFromNexus()"><ExternalLink /> Get from Nexus</button>
       </div>
       <!-- free Nexus accounts: one click per file on the website -->
-      <div v-if="manual.length && !store.syncing" class="inset nexus-strip">
+      <div v-if="manual.length" class="inset nexus-strip">
         <template v-if="store.nexusAssist">
           <Loader2 class="spin" />
           <span class="stack" style="gap: 2px; flex: 1; min-width: 0">
@@ -240,7 +250,7 @@ function added(m: ModView) {
           <button v-if="automatic.length" class="btn" @click="nextFromNexus()">Get {{ manual.length }} from Nexus</button>
         </template>
       </div>
-      <div v-if="store.syncing" class="progress" style="margin-top: 14px"><div :style="{ width: `${Math.max(percent, 3)}%` }" /></div>
+      <div v-if="installing" class="progress" style="margin-top: 14px"><div :style="{ width: `${Math.max(percent, 3)}%` }" /></div>
       <div v-else class="inset plan">
         <div v-for="p in plan" :key="p.key" class="plan-row">
           <span class="plan-action" :class="ACTION[p.action].cls">{{ ACTION[p.action].label }}</span>

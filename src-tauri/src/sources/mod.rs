@@ -147,7 +147,8 @@ pub async fn check(resp: reqwest::Response, what: &str) -> Result<reqwest::Respo
     let msg = serde_json::from_str::<serde_json::Value>(&body)
         .ok()
         .and_then(|v| v["error"]["message"].as_str().or(v["detail"].as_str()).map(str::to_string))
-        .unwrap_or_else(|| body.chars().take(200).collect());
+        // an HTML error page says nothing useful in a toast: the status is enough
+        .unwrap_or_else(|| if body.trim_start().starts_with('<') { String::new() } else { body.chars().take(200).collect() });
     Err(format!("{what}: {status} {msg}").trim().to_string())
 }
 

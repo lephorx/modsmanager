@@ -130,7 +130,7 @@ const LOADERS: { id: Loader; hint: string }[] = [
       <button v-if="!game" class="btn btn-ghost btn-sm" style="align-self: flex-start" @click="step = 'pick'"><ArrowLeft /> Back</button>
 
       <template v-if="!pathsOnly">
-        <span class="section-title">The game (for everyone)</span>
+        <h3 class="section-title dialog-section">The game (for everyone)</h3>
         <div class="field">
           <label for="g-name">Name</label>
           <input id="g-name" v-model="g.name" class="input" placeholder="Blade & Sorcery" />
@@ -173,7 +173,7 @@ const LOADERS: { id: Loader; hint: string }[] = [
         </div>
       </template>
 
-      <span class="section-title">On this computer</span>
+      <h3 class="section-title dialog-section">On this computer</h3>
       <div class="field">
         <label for="g-content">Mods folder <span class="hint">(content mods go here)</span></label>
         <div class="row" style="gap: 8px">

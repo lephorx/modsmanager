@@ -1,13 +1,15 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import { RouterLink, RouterView } from "vue-router";
-import { Check, ChevronDown, Gamepad2, History, Layers, Loader2, Pencil, Plus, RefreshCw, Settings as SettingsIcon, UserPlus } from "lucide-vue-next";
+import { Check, ChevronDown, Download, Gamepad2, History, Layers, Loader2, Pencil, Plus, RefreshCw, Settings as SettingsIcon, UserPlus } from "lucide-vue-next";
 import markUrl from "./assets/mark.svg";
 import markWhiteUrl from "./assets/mark-white.svg";
 import Toast from "./components/AppToast.vue";
 import SettingsDialog from "./components/SettingsDialog.vue";
 import GameDialog from "./components/GameDialog.vue";
 import InviteDialog from "./components/InviteDialog.vue";
+import QueuePanel from "./components/QueuePanel.vue";
+import { isActive } from "./lib/api";
 import SetupPage from "./pages/SetupPage.vue";
 import { settingsDialog, openSettings } from "./lib/settingsDialog";
 import { gameDialog } from "./lib/dialogs";
@@ -45,6 +47,9 @@ const people = computed(() => {
     .sort((a, b) => Number(b.me) - Number(a.me) || Number(b.online) - Number(a.online) || a.name.localeCompare(b.name));
 });
 const others = computed(() => people.value.filter((p) => !p.me));
+const queueBusy = computed(() => store.queue.filter(isActive).length);
+const queueWaiting = computed(() => store.queue.filter((j) => j.status === "waiting").length);
+const queueFailed = computed(() => store.queue.filter((j) => j.status === "failed").length);
 const behind = computed(() => others.value.filter((p) => p.pending).length);
 
 function stateText(p: (typeof people.value)[number]) {
@@ -121,6 +126,16 @@ const nav = [
               <button class="account-menu-item" @click="(menu = ''), (inviting = true)"><UserPlus /> Invite someone</button>
             </div>
           </div>
+          <button
+            class="btn btn-ghost btn-icon queue-button"
+            :class="{ busy: queueBusy, attention: !queueBusy && (queueWaiting || queueFailed) }"
+            :title="queueBusy ? `${queueBusy} downloading or queued` : queueWaiting ? `${queueWaiting} waiting for a click on Nexus` : queueFailed ? `${queueFailed} failed` : 'Downloads'"
+            aria-label="Downloads"
+            @click="store.queueOpen = true"
+          >
+            <Loader2 v-if="queueBusy" class="spin" /><Download v-else />
+            <span v-if="queueBusy || queueWaiting || queueFailed" class="queue-badge num">{{ queueBusy || queueWaiting || queueFailed }}</span>
+          </button>
           <span class="live" :class="{ on: store.live }" :title="store.live ? 'Live: changes show up right away' : 'Not connected to the shared database'">
             <span class="run-dot" />{{ store.live ? "Live" : "Offline" }}
           </span>
@@ -153,6 +168,7 @@ const nav = [
       <GameDialog v-if="gameDialog.edit" :game="gameDialog.edit" @close="gameDialog.edit = null" />
       <GameDialog v-if="gameDialog.paths" :game="gameDialog.paths" paths-only @close="gameDialog.paths = null" />
       <InviteDialog v-if="inviting" @close="inviting = false" />
+      <QueuePanel v-if="store.queueOpen" />
     </template>
     <SetupPage v-else-if="ready" />
     <Toast />

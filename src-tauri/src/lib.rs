@@ -34,7 +34,8 @@ pub struct AppState {
     local: Mutex<Local>,
     db: Mutex<Option<Arc<Client>>>,
     http: reqwest::Client,
-    sync_lock: Mutex<()>,
+    /// Everything that installs or removes files, in order.
+    queue: Queue,
     listener: std::sync::Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     /// Live updates are connected (also sent as the `live` event).
     live: AtomicBool,
@@ -316,7 +317,22 @@ fn handle_nxm(app: &AppHandle, link: &str) -> R<()> {
     let l = nexus::parse_nxm(link).ok_or("That isn't a Nexus Mods download link (nxm://…)")?;
     let key = l.key.ok_or("That link has no download key; use \"Mod Manager Download\" on the file's page")?;
     let state = app.state::<AppState>();
-    state.nxm.lock().unwrap().insert(format!("{}:{}", l.mod_id, l.file_id), key);
+    let slot = format!("{}:{}", l.mod_id, l.file_id);
+    state.nxm.lock().unwrap().insert(slot.clone(), key);
+    let woke = {
+        let mut jobs = state.queue.jobs.lock().unwrap();
+        let mut woke = false;
+        for j in jobs.iter_mut().filter(|j| j.status == "waiting" && j.nexus.as_deref() == Some(&slot)) {
+            j.status = "queued";
+            j.error = None;
+            woke = true;
+        }
+        woke
+    };
+    if woke {
+        let _ = app.emit("queue", state.queue.snapshot());
+        kick(app);
+    }
     let _ = app.emit("nexus-link", serde_json::json!({ "domain": l.domain, "modId": l.mod_id, "fileId": l.file_id }));
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.unminimize();
@@ -393,6 +409,7 @@ async fn with_modio_id(state: &AppState, mut game: NewGame) -> R<NewGame> {
     // a pasted community link: thunderstore.io/c/<community>/…
     let ts = game.thunderstore.trim().trim_end_matches('/');
     game.thunderstore = ts.rsplit("/c/").next().unwrap_or("").split('/').next().unwrap_or("").to_string();
+    game.nexus = nexus::game_domain(&game.nexus);
     let slug = game.modio_slug.trim().to_string();
     if slug.is_empty() {
         game.modio_id = 0;
@@ -483,7 +500,7 @@ async fn overview(state: State<'_, AppState>, game: i64) -> R<Overview> {
     if has_nexus && !nexus_acc.as_ref().is_some_and(|a| a.premium) {
         for item in plan.iter_mut() {
             if let Some(m) = mods.iter().find(|m| Some(m.id) == item.id && m.data.source == "nexus") {
-                item.manual_url = Some(nexus::file_page(&g.data.nexus, &m.data.source_id, &m.data.file_ref));
+                item.manual_url = Some(nexus::file_page(&nexus::game_domain(&g.data.nexus), &m.data.source_id, &m.data.file_ref));
             }
         }
     }
@@ -611,29 +628,74 @@ async fn events(state: State<'_, AppState>, game: i64) -> R<Vec<Event>> {
     db::events(&db, game, 300).await
 }
 
-// ── commands: sync ─────────────────────────────────────────────────────────
+// ── the install queue ──────────────────────────────────────────────────────
+//
+// Everything that changes files goes through one queue: Sync, "install right away" after adding,
+// auto-sync and Nexus clicks just add jobs. Up to `PARALLEL` run at once; each job reports its
+// own progress. A mod is never queued twice, and the window sees the whole queue on every change
+// (the `queue` event).
 
-#[derive(Serialize, Clone)]
+/// Jobs that run at the same time.
+const PARALLEL: usize = 3;
+/// Finished jobs kept for the panel.
+const KEEP_FINISHED: usize = 50;
+
+#[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
-struct Progress {
+pub struct Job {
+    id: u64,
     game: i64,
-    index: usize,
-    count: usize,
+    game_name: String,
+    /// `source:source_id`, as in the local state
+    key: String,
+    /// The mod on the list (None for removals)
+    mod_id: Option<i64>,
     name: String,
+    /// install | update | repair | remove
     action: &'static str,
-    /// downloading | installing | removing | done
-    phase: &'static str,
+    /// queued | downloading | installing | removing | done | failed | waiting
+    status: &'static str,
     done: u64,
     total: u64,
+    error: Option<String>,
+    /// Nexus without Premium: the page to click "Slow download" on
+    manual_url: Option<String>,
+    /// Nexus `mod_id:file_id`, to match a clicked nxm:// link
+    nexus: Option<String>,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SyncResult {
-    done: usize,
-    failed: Vec<(String, String)>,
-    /// Nexus Mods files a free account has to click on the website: (name, page)
-    waiting: Vec<(String, String)>,
+impl Job {
+    fn active(&self) -> bool {
+        matches!(self.status, "queued" | "downloading" | "installing" | "removing")
+    }
+    fn finished(&self) -> bool {
+        matches!(self.status, "done" | "failed")
+    }
+}
+
+#[derive(Default)]
+pub struct Queue {
+    jobs: std::sync::Mutex<Vec<Job>>,
+    next_id: std::sync::atomic::AtomicU64,
+    /// A worker is draining the queue.
+    working: AtomicBool,
+}
+
+/// How the queue tells the window (or a test) that it changed.
+type QueueEmit = dyn Fn(Vec<Job>) + Send + Sync;
+
+impl Queue {
+    fn snapshot(&self) -> Vec<Job> {
+        self.jobs.lock().unwrap().clone()
+    }
+    fn update(&self, id: u64, f: impl FnOnce(&mut Job)) {
+        if let Some(j) = self.jobs.lock().unwrap().iter_mut().find(|j| j.id == id) {
+            f(j);
+        }
+    }
+    fn get(&self, id: u64) -> Option<Job> {
+        self.jobs.lock().unwrap().iter().find(|j| j.id == id).cloned()
+    }
 }
 
 /// The folder a code mod gets for itself (BepInEx plugins): Thunderstore's `Namespace-Name`.
@@ -645,16 +707,16 @@ fn package_name(m: &NewMod) -> String {
     }
 }
 
+/// Downloads and installs one mod; `progress(phase, done, total)` reports along the way.
 #[allow(clippy::too_many_arguments)]
 async fn install_one(
-    emit: &(dyn Fn(Progress) + Send + Sync),
+    progress: &(dyn Fn(&'static str, u64, u64) + Send + Sync),
     state: &AppState,
     settings: &Settings,
     game: &Game,
     paths: &GamePaths,
     m: &SharedMod,
     old: Option<Installed>,
-    progress: Progress,
 ) -> R<Installed> {
     let code = m.data.target == "code" && game.data.loader != "none";
     if code && paths.game_dir.trim().is_empty() {
@@ -669,9 +731,9 @@ async fn install_one(
     let staging = state.temp.join(format!("unpack-{}", m.id));
     let mut last = Instant::now() - Duration::from_secs(1);
     let got = install::download(fetch, &file, |done, total| {
-        if last.elapsed() >= Duration::from_millis(120) || done == total {
+        if last.elapsed() >= Duration::from_millis(150) || done == total {
             last = Instant::now();
-            emit(Progress { phase: "downloading", done, total, ..progress.clone() });
+            progress("downloading", done, total);
         }
     })
     .await;
@@ -682,7 +744,7 @@ async fn install_one(
             return Err(e);
         }
     };
-    emit(Progress { phase: "installing", done: 0, total: 0, ..progress.clone() });
+    progress("installing", 0, 0);
     let (paths2, loader, package, name) = (paths.clone(), game.data.loader.clone(), package_name(&m.data), m.data.name.clone());
     let (file2, staging2) = (file.clone(), staging.clone());
     let placed = tauri::async_runtime::spawn_blocking(move || -> R<(Root, Vec<String>)> {
@@ -706,71 +768,239 @@ async fn install_one(
     Ok(Installed { name: m.data.name.clone(), pin: m.data.pin(), version: m.data.version.clone(), root, paths: placed, installed_at: chrono::Utc::now() })
 }
 
-/// Makes this computer match one game's list. `emit` reports progress.
-async fn run_sync(state: &AppState, game: i64, emit: &(dyn Fn(Progress) + Send + Sync)) -> R<SyncResult> {
-    let _running = state.sync_lock.try_lock().map_err(|_| "A sync is already running".to_string())?;
+/// Adds what this computer has to do for a game to the queue; returns how many jobs were added.
+/// Free Nexus files go in as `waiting` until their click arrives.
+async fn enqueue(state: &AppState, game: i64) -> R<usize> {
     let (db, settings, g, paths) = state.game(game).await?;
     let mods = db::list_mods(&db, game).await?;
     let items = plan(&paths, &state.local.lock().await.game(game), &mods);
-    let count = items.len();
-    let mut result = SyncResult { done: 0, failed: vec![], waiting: vec![] };
-    for (index, item) in items.iter().enumerate() {
-        let progress = Progress { game, index, count, name: item.name.clone(), action: item.action, phase: "removing", done: 0, total: 0 };
-        let old = state.local.lock().await.game(game).installed.get(&item.key).cloned();
-        let outcome: R<Option<Installed>> = if item.action == "remove" {
-            emit(progress.clone());
-            match old {
-                Some(old) => {
-                    let p = paths.clone();
-                    tauri::async_runtime::spawn_blocking(move || install::remove(&p, &old)).await.map_err(|e| e.to_string()).and_then(|r| r).map(|_| None)
-                }
-                None => Ok(None),
+    let premium = if mods.iter().any(|m| m.data.source == "nexus") { state.nexus_account(false).await.is_some_and(|a| a.premium) } else { false };
+    let _ = settings;
+    let mut jobs = state.queue.jobs.lock().unwrap();
+    let mut added = 0;
+    for item in items {
+        // already queued, running or waiting for its Nexus click
+        if jobs.iter().any(|j| j.game == game && j.key == item.key && (j.active() || j.status == "waiting")) {
+            continue;
+        }
+        let m = mods.iter().find(|m| Some(m.id) == item.id);
+        let nexus = m.filter(|m| m.data.source == "nexus").map(|m| format!("{}:{}", m.data.source_id, m.data.file_ref));
+        let has_key = nexus.as_ref().is_some_and(|k| state.nxm.lock().unwrap().contains_key(k));
+        let manual = nexus.is_some() && !premium && !has_key;
+        jobs.push(Job {
+            id: state.queue.next_id.fetch_add(1, Ordering::SeqCst) + 1,
+            game,
+            game_name: g.data.name.clone(),
+            key: item.key.clone(),
+            mod_id: item.id,
+            name: item.name.clone(),
+            action: item.action,
+            status: if manual { "waiting" } else { "queued" },
+            done: 0,
+            total: item.size.max(0) as u64,
+            error: None,
+            manual_url: if manual { m.map(|m| nexus::file_page(&nexus::game_domain(&g.data.nexus), &m.data.source_id, &m.data.file_ref)) } else { None },
+            nexus,
+        });
+        added += 1;
+    }
+    // keep the panel short: drop the oldest finished jobs
+    let finished = jobs.iter().filter(|j| j.finished()).count();
+    if finished > KEEP_FINISHED {
+        let mut drop = finished - KEEP_FINISHED;
+        jobs.retain(|j| {
+            if drop > 0 && j.finished() {
+                drop -= 1;
+                false
+            } else {
+                true
             }
-        } else {
-            match mods.iter().find(|m| Some(m.id) == item.id) {
-                Some(m) => install_one(emit, state, &settings, &g, &paths, m, old, progress.clone()).await.map(Some),
-                None => Ok(None),
-            }
+        });
+    }
+    Ok(added)
+}
+
+/// Runs one job to its end.
+async fn run_job(state: &AppState, id: u64, emit: &QueueEmit) {
+    let Some(job) = state.queue.get(id) else { return };
+    let report = |f: &dyn Fn(&mut Job)| {
+        state.queue.update(id, |j| f(j));
+        emit(state.queue.snapshot());
+    };
+    let outcome: R<Option<Option<Installed>>> = async {
+        let (db, settings, g, paths) = state.game(job.game).await?;
+        let old = state.local.lock().await.game(job.game).installed.get(&job.key).cloned();
+        if job.action == "remove" {
+            report(&|j| j.status = "removing");
+            let Some(old) = old else { return Ok(Some(None)) };
+            let p = paths.clone();
+            tauri::async_runtime::spawn_blocking(move || install::remove(&p, &old)).await.map_err(|e| e.to_string())??;
+            return Ok(Some(None));
+        }
+        // the list may have changed since it was queued: install what's on it now
+        let m = match job.mod_id {
+            Some(mid) => db::get_mod(&db, mid).await.ok(),
+            None => None,
         };
-        match outcome {
-            Ok(installed) => {
-                let mut local = state.local.lock().await;
-                let lg = local.game_mut(game);
-                match installed {
-                    Some(i) => {
-                        lg.installed.insert(item.key.clone(), i);
-                    }
-                    None => {
-                        lg.installed.remove(&item.key);
-                    }
+        let Some(m) = m else { return Ok(None) };
+        if old.as_ref().is_some_and(|o| o.pin == m.data.pin() && install::is_present(&paths, o)) {
+            return Ok(None);
+        }
+        let progress = |phase: &'static str, done: u64, total: u64| {
+            report(&|j| {
+                j.status = phase;
+                j.done = done;
+                if total > 0 {
+                    j.total = total;
                 }
-                state.save_local(&local).await?;
-                result.done += 1;
+            })
+        };
+        install_one(&progress, state, &settings, &g, &paths, &m, old).await.map(|i| Some(Some(i)))
+    }
+    .await;
+    match outcome {
+        // nothing left to do (already matched, or the mod left the list)
+        Ok(None) => report(&|j| j.status = "done"),
+        Ok(Some(installed)) => {
+            let mut local = state.local.lock().await;
+            let lg = local.game_mut(job.game);
+            match installed {
+                Some(i) => {
+                    lg.installed.insert(job.key.clone(), i);
+                }
+                None => {
+                    lg.installed.remove(&job.key);
+                }
             }
-            Err(e) => match e.strip_prefix(nexus::NEEDS_CLICK) {
-                Some(page) => result.waiting.push((item.name.clone(), page.to_string())),
-                None => result.failed.push((item.name.clone(), e)),
-            },
+            let saved = state.save_local(&local).await;
+            drop(local);
+            report(&|j| match &saved {
+                Ok(()) => {
+                    j.status = "done";
+                    j.done = j.total;
+                }
+                Err(e) => {
+                    j.status = "failed";
+                    j.error = Some(e.clone());
+                }
+            });
         }
+        Err(e) => match e.strip_prefix(nexus::NEEDS_CLICK) {
+            Some(page) => {
+                let page = page.to_string();
+                report(&|j| {
+                    j.status = "waiting";
+                    j.manual_url = Some(page.clone());
+                    j.done = 0;
+                })
+            }
+            None => report(&|j| {
+                j.status = "failed";
+                j.error = Some(e.clone());
+            }),
+        },
     }
-    emit(Progress { game, index: count, count, name: String::new(), action: "install", phase: "done", done: 0, total: 0 });
-    let me = settings.name.trim();
-    if !me.is_empty() {
-        let left = (result.failed.len() + result.waiting.len()) as i32;
-        db::heartbeat(&db, me, game, left, left == 0).await?;
-        if count > 0 {
-            db::notify(&db, game, me, "synced", "").await?;
+}
+
+/// Works through the queue until nothing is queued, `PARALLEL` jobs at a time; then tells the
+/// others where this computer stands in each game it touched.
+async fn drain(state: &AppState, emit: &QueueEmit) {
+    let mut touched: Vec<i64> = Vec::new();
+    loop {
+        let batch: Vec<u64> = {
+            let mut jobs = state.queue.jobs.lock().unwrap();
+            let ids: Vec<u64> = jobs.iter().filter(|j| j.status == "queued").take(PARALLEL).map(|j| j.id).collect();
+            for j in jobs.iter_mut().filter(|j| ids.contains(&j.id)) {
+                j.status = if j.action == "remove" { "removing" } else { "downloading" };
+                if !touched.contains(&j.game) {
+                    touched.push(j.game);
+                }
+            }
+            ids
+        };
+        if batch.is_empty() {
+            break;
         }
+        emit(state.queue.snapshot());
+        futures_util::future::join_all(batch.into_iter().map(|id| run_job(state, id, emit))).await;
     }
-    Ok(result)
+    let me = state.me().await;
+    if me.is_empty() {
+        return;
+    }
+    for game in touched {
+        let Ok((db, _, _, paths)) = state.game(game).await else { continue };
+        let Ok(mods) = db::list_mods(&db, game).await else { continue };
+        let left = plan(&paths, &state.local.lock().await.game(game), &mods).len() as i32;
+        let _ = db::heartbeat(&db, &me, game, left, left == 0).await;
+        let _ = db::notify(&db, game, &me, "synced", "").await;
+    }
+}
+
+/// Starts a worker unless one is running.
+fn kick(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    if state.queue.working.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<AppState>();
+        let emitter = app.clone();
+        let emit = move |jobs: Vec<Job>| {
+            let _ = emitter.emit("queue", jobs);
+        };
+        loop {
+            drain(&state, &emit).await;
+            state.queue.working.store(false, Ordering::SeqCst);
+            // something was queued between the last check and letting go: go again
+            let more = state.queue.jobs.lock().unwrap().iter().any(|j| j.status == "queued");
+            if !more || state.queue.working.swap(true, Ordering::SeqCst) {
+                break;
+            }
+        }
+        emit(state.queue.snapshot());
+    });
+}
+
+/// Queues everything this computer has to do for a game.
+#[tauri::command]
+async fn queue_sync(app: AppHandle, state: State<'_, AppState>, game: i64) -> R<usize> {
+    let added = enqueue(&state, game).await?;
+    let _ = app.emit("queue", state.queue.snapshot());
+    kick(&app);
+    Ok(added)
 }
 
 #[tauri::command]
-async fn sync_now(app: AppHandle, state: State<'_, AppState>, game: i64) -> R<SyncResult> {
-    let emit = move |p: Progress| {
-        let _ = app.emit("sync-progress", p);
-    };
-    run_sync(&state, game, &emit).await
+fn queue_list(state: State<'_, AppState>) -> Vec<Job> {
+    state.queue.snapshot()
+}
+
+/// Takes a job that hasn't started (or waits for its Nexus click) off the queue.
+#[tauri::command]
+fn queue_cancel(app: AppHandle, state: State<'_, AppState>, id: u64) {
+    state.queue.jobs.lock().unwrap().retain(|j| j.id != id || !(j.status == "queued" || j.status == "waiting"));
+    let _ = app.emit("queue", state.queue.snapshot());
+}
+
+#[tauri::command]
+fn queue_retry(app: AppHandle, state: State<'_, AppState>, id: u64) {
+    state.queue.update(id, |j| {
+        if j.status == "failed" {
+            j.status = "queued";
+            j.error = None;
+            j.done = 0;
+        }
+    });
+    let _ = app.emit("queue", state.queue.snapshot());
+    kick(&app);
+}
+
+#[tauri::command]
+fn queue_clear(app: AppHandle, state: State<'_, AppState>) {
+    state.queue.jobs.lock().unwrap().retain(|j| !j.finished());
+    let _ = app.emit("queue", state.queue.snapshot());
 }
 
 // ── commands: housekeeping ─────────────────────────────────────────────────
@@ -932,7 +1162,7 @@ pub fn run() {
                 local: Mutex::new(local),
                 db: Mutex::new(None),
                 http,
-                sync_lock: Mutex::new(()),
+                queue: Queue::default(),
                 listener: std::sync::Mutex::new(None),
                 live: AtomicBool::new(false),
                 local_migrated: AtomicBool::new(false),
@@ -981,7 +1211,11 @@ pub fn run() {
             check_updates,
             update_mod,
             events,
-            sync_now,
+            queue_sync,
+            queue_list,
+            queue_cancel,
+            queue_retry,
+            queue_clear,
             unmanaged,
             delete_unmanaged,
             ignore_unmanaged,
@@ -1017,7 +1251,7 @@ mod e2e {
             local: Mutex::new(Local::default()),
             db: Mutex::new(None),
             http: reqwest::Client::builder().user_agent("ModsManager-test").build().unwrap(),
-            sync_lock: Mutex::new(()),
+            queue: Queue::default(),
             listener: std::sync::Mutex::new(None),
             live: AtomicBool::new(false),
             local_migrated: AtomicBool::new(false),
@@ -1036,8 +1270,14 @@ mod e2e {
         let paths = state.settings.read().await.paths(game);
         let mods = db::list_mods(&db, game).await.unwrap();
         let actions = plan(&paths, &state.local.lock().await.game(game), &mods).iter().map(|p| p.action).collect();
-        let r = run_sync(state, game, &|_| {}).await.unwrap();
-        assert!(r.failed.is_empty(), "{:?}", r.failed);
+        enqueue(state, game).await.unwrap();
+        // queueing twice adds nothing
+        assert_eq!(enqueue(state, game).await.unwrap(), 0);
+        drain(state, &|_| {}).await;
+        let jobs = state.queue.snapshot();
+        let failed: Vec<_> = jobs.iter().filter(|j| j.status != "done").map(|j| (&j.name, j.status, &j.error)).collect();
+        assert!(failed.is_empty(), "{failed:?}");
+        state.queue.jobs.lock().unwrap().clear();
         actions
     }
 

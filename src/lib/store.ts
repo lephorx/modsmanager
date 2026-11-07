@@ -1,6 +1,6 @@
 import { reactive } from "vue";
 import { listen } from "@tauri-apps/api/event";
-import { api, type GameView, type NewMod, type Overview, type Progress, type Settings } from "./api";
+import { api, isActive, type GameView, type Job, type NewMod, type Overview, type Settings } from "./api";
 import { errorText, toast } from "./toast";
 
 /** Everything the window shows, kept fresh by the backend's events. */
@@ -13,14 +13,23 @@ export const store = reactive({
   error: "",
   loading: false,
   live: false,
+  /** the install queue (every game) */
+  queue: [] as Job[],
+  /** something is installing or removing files (any game) */
   syncing: false,
-  progress: null as Progress | null,
   /** newer files found by "Check for updates", by mod id (for the shown game) */
   updates: {} as Record<string, NewMod>,
   checking: false,
   /** walking through Nexus files a free account has to click, one page at a time */
   nexusAssist: false,
+  /** the queue panel in the top bar */
+  queueOpen: false,
 });
+
+/** The queue's jobs for the game on screen. */
+export function gameJobs(game: number | null = currentGame()) {
+  return store.queue.filter((j) => j.game === game);
+}
 
 export const ONLINE_MS = 150_000;
 
@@ -85,27 +94,48 @@ export function refresh(): Promise<void> {
   return refreshing;
 }
 
-export async function runSync() {
+/** Queues everything this computer has to do for the game on screen. */
+export async function runSync(quiet = false) {
   const game = currentGame();
-  if (store.syncing || game == null) return;
-  store.syncing = true;
-  store.progress = null;
+  if (game == null) return;
   try {
-    const r = await api.sync(game);
-    if (r.failed.length) {
-      toast.error(`${r.failed.length} couldn't sync: ${r.failed.map(([n, e]) => `${n} (${e})`).join("; ")}`);
-    } else if (r.done) {
-      toast.success(r.done === 1 ? "1 change synced" : `${r.done} changes synced`);
-    } else if (r.waiting.length && !store.nexusAssist) {
-      toast.info(r.waiting.length === 1 ? "1 mod from Nexus needs a click" : `${r.waiting.length} mods from Nexus need a click`);
-    }
+    const added = await api.queueSync(game);
+    if (!quiet && !added && !gameJobs(game).some((j) => isActive(j) || j.status === "waiting")) toast.success("Nothing to do: this computer matches the list");
   } catch (e) {
     toast.error(errorText(e));
-  } finally {
-    store.syncing = false;
-    store.progress = null;
-    await refresh();
   }
+}
+
+/** A batch of jobs ran out: say how it went, then refresh the list. */
+let batch = { done: 0, failed: 0 };
+let wasActive = false;
+let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+function onQueue(jobs: Job[]) {
+  const before = new Map(store.queue.map((j) => [j.id, j.status]));
+  store.queue = jobs;
+  for (const j of jobs) {
+    const was = before.get(j.id);
+    if (was === j.status) continue;
+    if (j.status === "done") batch.done++;
+    if (j.status === "failed") {
+      batch.failed++;
+      toast.error(`${j.name}: ${j.error ?? "failed"}`);
+    }
+  }
+  const active = jobs.some(isActive);
+  store.syncing = active;
+  // the list's install states follow the files: refresh after changes, not on every progress tick
+  if ([...before].some(([id, st]) => st !== jobs.find((j) => j.id === id)?.status)) {
+    clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(() => void refresh(), 400);
+  }
+  if (wasActive && !active) {
+    if (batch.done && !batch.failed) toast.success(batch.done === 1 ? "1 change installed" : `${batch.done} changes installed`);
+    else if (batch.done && batch.failed) toast.info(`${batch.done} installed, ${batch.failed} failed (see Downloads)`);
+    batch = { done: 0, failed: 0 };
+  }
+  wasActive = active;
+  if (store.nexusAssist) followNexus();
 }
 
 export async function checkUpdates(quiet = false) {
@@ -125,23 +155,40 @@ export async function checkUpdates(quiet = false) {
 
 /** Nexus files this computer still has to click on the website (free accounts). */
 export function nexusPending() {
-  return (store.overview?.plan ?? []).filter((p) => p.manualUrl);
+  const waiting = gameJobs().filter((j) => j.status === "waiting");
+  const queuedKeys = new Set(gameJobs().map((j) => j.key));
+  const notQueued = (store.overview?.plan ?? []).filter((p) => p.manualUrl && !queuedKeys.has(p.key));
+  return [...waiting.map((j) => ({ key: j.key, name: j.name, manualUrl: j.manualUrl })), ...notQueued.map((p) => ({ key: p.key, name: p.name, manualUrl: p.manualUrl }))];
 }
 
+/** The Nexus job whose page is open, waiting for its click. */
+let assisting: string | null = null;
+
 /** Opens the next Nexus file's page; the click there comes back as an nxm:// link. */
-export function nextFromNexus() {
-  const next = nexusPending()[0];
+export async function nextFromNexus() {
+  // make sure the Nexus files are in the queue, so their clicks have somewhere to go
+  if (nexusPending().some((p) => !gameJobs().some((j) => j.key === p.key))) await runSync(true);
+  const next = gameJobs().find((j) => j.status === "waiting" && j.manualUrl);
   if (!next?.manualUrl) {
-    if (store.nexusAssist) toast.success("Everything from Nexus is installed");
+    if (store.nexusAssist) toast.success("Everything from Nexus is in");
     store.nexusAssist = false;
+    assisting = null;
     return;
   }
   store.nexusAssist = true;
+  assisting = next.key;
   void api.openUrl(next.manualUrl);
+}
+
+/** After the clicked file finished, open the next one. */
+function followNexus() {
+  const j = gameJobs().find((x) => x.key === assisting);
+  if (!j || j.status === "done" || j.status === "failed") void nextFromNexus();
 }
 
 export function stopNexus() {
   store.nexusAssist = false;
+  assisting = null;
 }
 
 const VERBS: Record<string, string> = { add: "added", update: "updated", remove: "removed", import: "imported" };
@@ -150,9 +197,8 @@ let started = false;
 export async function startEvents() {
   if (started) return;
   started = true;
-  await listen<Progress>("sync-progress", (e) => {
-    store.progress = e.payload.phase === "done" ? null : e.payload;
-  });
+  await listen<Job[]>("queue", (e) => onQueue(e.payload));
+  store.queue = await api.queue().catch(() => []);
   await listen<boolean>("live", (e) => (store.live = e.payload));
   // a "Mod Manager Download" click on Nexus: install that file, then open the next one
   await listen<{ modId: string; fileId: string }>("nexus-link", async (e) => {
@@ -162,9 +208,6 @@ export async function startEvents() {
       return;
     }
     toast.info(m ? `Got ${m.name} from Nexus, installing…` : "Got a file from Nexus");
-    while (store.syncing) await new Promise((r) => setTimeout(r, 300));
-    await runSync();
-    if (store.nexusAssist) nextFromNexus();
   });
   await listen<string>("remote-changed", async (e) => {
     let change: { game?: number; actor?: string; action?: string; name?: string } = {};
@@ -182,7 +225,7 @@ export async function startEvents() {
     const here = change.game == null || change.game === currentGame();
     const gameName = store.games?.find((g) => g.id === change.game)?.name;
     toast.info(`${change.actor} ${VERBS[change.action]} ${change.name}${!here && gameName ? ` in ${gameName}` : ""}`);
-    if (here && store.settings?.autoSync && store.overview?.plan.length) void runSync();
+    if (here && store.settings?.autoSync && store.overview?.plan.length) void runSync(true);
   });
   // presence: tell the others we're here, see who else is
   setInterval(() => void refresh(), 60_000);

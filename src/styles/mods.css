@@ -530,3 +530,126 @@ html[data-design="modern"] .people:hover {
   height: 18px;
   color: var(--status-orange);
 }
+
+/* ── install queue ── */
+.queue-button {
+  position: relative;
+}
+.queue-button.busy {
+  color: var(--tint);
+}
+.queue-button.attention {
+  color: var(--status-orange);
+}
+.queue-badge {
+  position: absolute;
+  top: 1px;
+  right: 1px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: var(--primary);
+  color: var(--primary-foreground);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 16px;
+  text-align: center;
+}
+.queue-button.attention .queue-badge {
+  background: var(--status-orange);
+  color: var(--on-fill);
+}
+.queue-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+}
+.queue-panel {
+  position: absolute;
+  top: 58px;
+  right: 16px;
+  display: flex;
+  flex-direction: column;
+  width: 420px;
+  max-height: min(560px, calc(100vh - 80px));
+  padding: 0;
+  overflow: hidden;
+}
+.queue-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 10px 10px 14px;
+  border-bottom: 1px solid var(--separator);
+}
+.queue-list {
+  overflow: auto;
+  padding: 4px 0 8px;
+}
+.queue-group {
+  display: block;
+  padding: 10px 14px 4px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted-foreground);
+}
+.queue-job {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px 8px 14px;
+  font-size: 13px;
+}
+.queue-icon {
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  width: 18px;
+  color: var(--muted-foreground);
+}
+.queue-icon svg {
+  width: 16px;
+  height: 16px;
+}
+.queue-job[data-status="done"] .queue-icon {
+  color: var(--status-green);
+}
+.queue-job[data-status="failed"] .queue-icon,
+.queue-job[data-status="failed"] .hint.selectable {
+  color: var(--destructive);
+}
+.queue-job[data-status="waiting"] .queue-icon {
+  color: var(--status-orange);
+}
+.queue-job[data-status="downloading"] .queue-icon,
+.queue-job[data-status="installing"] .queue-icon,
+.queue-job[data-status="removing"] .queue-icon {
+  color: var(--tint);
+}
+.queue-progress {
+  display: block;
+  height: 4px;
+  margin-top: 2px;
+}
+.queue-progress > span {
+  display: block;
+  height: 100%;
+  background: var(--primary);
+  transition: width 0.2s;
+}
+html[data-design="modern"] .queue-progress > span {
+  border-radius: 999px;
+}
+
+/* section headings inside a dialog: their own line, less space than on a page */
+.section-title.dialog-section {
+  display: block;
+  margin: 10px 0 0;
+}
+.section-title.dialog-section:first-child,
+.dialog-body > .btn + .section-title.dialog-section {
+  margin-top: 0;
+}

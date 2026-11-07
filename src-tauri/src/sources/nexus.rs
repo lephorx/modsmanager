@@ -113,8 +113,28 @@ async fn json(req: reqwest::RequestBuilder, what: &str) -> Result<(reqwest::Stat
     Ok((status, resp.json().await.map_err(|e| format!("{what}: {}", e.without_url()))?))
 }
 
-fn domain<'a>(ctx: &'a Ctx<'_>) -> Result<&'a str, String> {
-    let d = ctx.game.data.nexus.trim();
+/// The game's name on Nexus (`bladeandsorcery`) from that name or any nexusmods.com link to the
+/// game or one of its mods: `nexusmods.com/games/bladeandsorcery`, `nexusmods.com/bladeandsorcery/mods/528`.
+pub fn game_domain(input: &str) -> String {
+    let s = input.trim().trim_end_matches('/');
+    let with_scheme = if s.contains("nexusmods.com") && !s.contains("://") { format!("https://{s}") } else { s.to_string() };
+    if let Ok(u) = url::Url::parse(&with_scheme) {
+        if u.host_str().is_some_and(|h| h.ends_with("nexusmods.com")) {
+            let segs: Vec<&str> = u.path_segments().map(|p| p.filter(|x| !x.is_empty()).collect()).unwrap_or_default();
+            let name = match segs.as_slice() {
+                ["games", name, ..] => *name,
+                [name, ..] => *name,
+                [] => "",
+            };
+            return name.to_ascii_lowercase();
+        }
+    }
+    s.to_ascii_lowercase()
+}
+
+fn domain(ctx: &Ctx<'_>) -> Result<String, String> {
+    // games saved with a full link before links were understood still work
+    let d = game_domain(&ctx.game.data.nexus);
     if d.is_empty() {
         return Err(format!("{} isn't set up for Nexus Mods (Edit game → Nexus Mods)", ctx.game.data.name));
     }
@@ -173,7 +193,7 @@ fn to_new(ctx: &Ctx<'_>, m: &Value, f: &Value, mod_id: &str, target: &str) -> Ne
         file_ref: s(&f["file_id"]),
         file_hash: String::new(),
         file_size: f["size_in_bytes"].as_i64().or_else(|| f["size_kb"].as_i64().map(|k| k * 1024)).unwrap_or(0),
-        page_url: format!("https://www.nexusmods.com/{}/mods/{mod_id}", ctx.game.data.nexus),
+        page_url: format!("https://www.nexusmods.com/{}/mods/{mod_id}", game_domain(&ctx.game.data.nexus)),
         thumb_url: s(&m["picture_url"]),
         summary: s(&m["summary"]),
         author: s(&m["author"]),
@@ -185,7 +205,7 @@ pub async fn resolve(ctx: &Ctx<'_>, input: &str, target: &str) -> Result<NewMod,
     let (page_domain, mod_id, file_id) = parse_page(input).ok_or("That doesn't look like a Nexus Mods page (nexusmods.com/<game>/mods/<id>)")?;
     let d = domain(ctx)?;
     if page_domain != d {
-        return Err(format!("That mod is for \"{page_domain}\" on Nexus, but {} is \"{d}\"", ctx.game.data.name));
+        return Err(format!("That mod is for \"{page_domain}\" on Nexus, but {} is set up as \"{d}\" (Edit game → Nexus Mods game)", ctx.game.data.name));
     }
     let (status, m) = json(get(ctx, &format!("/games/{d}/mods/{mod_id}.json"))?, "Nexus Mods").await?;
     if status == reqwest::StatusCode::FORBIDDEN {
@@ -227,7 +247,7 @@ pub async fn fetch(ctx: &Ctx<'_>, cur: &NewMod) -> Result<Fetch, String> {
         if key.is_some() {
             ctx.nxm.lock().unwrap().remove(&slot);
         }
-        return Err(format!("{NEEDS_CLICK}{}", file_page(d, &cur.source_id, &cur.file_ref)));
+        return Err(format!("{NEEDS_CLICK}{}", file_page(&d, &cur.source_id, &cur.file_ref)));
     }
     let uri = links.as_array().and_then(|a| a.first()).map(|l| s(&l["URI"])).filter(|u| !u.is_empty()).ok_or("Nexus Mods gave no download link")?;
     // a key works once
@@ -256,6 +276,21 @@ mod tests {
         assert!(parse_nxm("nxm://bonelab/mods/123/files/4567").unwrap().key.is_none());
         assert!(parse_nxm("https://example.com/mods/1/files/2").is_none());
         assert!(parse_nxm("nxm://bonelab/collections/x").is_none());
+    }
+
+    #[test]
+    fn reads_the_game_from_any_nexus_link() {
+        for input in [
+            "bladeandsorcery",
+            "BladeAndSorcery ",
+            "https://www.nexusmods.com/games/bladeandsorcery",
+            "https://www.nexusmods.com/games/bladeandsorcery/",
+            "https://www.nexusmods.com/bladeandsorcery/mods/528",
+            "nexusmods.com/bladeandsorcery",
+        ] {
+            assert_eq!(game_domain(input), "bladeandsorcery", "{input}");
+        }
+        assert_eq!(game_domain(""), "");
     }
 
     #[test]

@@ -150,23 +150,26 @@ export interface Unmanaged {
   isDir: boolean;
 }
 
-export interface Progress {
+export type JobStatus = "queued" | "downloading" | "installing" | "removing" | "done" | "failed" | "waiting";
+
+/** One install, update or removal in the queue. */
+export interface Job {
+  id: number;
   game: number;
-  index: number;
-  count: number;
+  gameName: string;
+  key: string;
+  modId: number | null;
   name: string;
   action: Action;
-  phase: "downloading" | "installing" | "removing" | "done";
+  status: JobStatus;
   done: number;
   total: number;
+  error: string | null;
+  /** Nexus without Premium: the page to click "Slow download" on */
+  manualUrl: string | null;
 }
 
-export interface SyncResult {
-  done: number;
-  failed: [string, string][];
-  /** Nexus files waiting for a click on the website: [name, page] */
-  waiting: [string, string][];
-}
+export const isActive = (j: Job) => j.status === "queued" || j.status === "downloading" || j.status === "installing" || j.status === "removing";
 
 export interface Invite {
   databaseUrl: string;
@@ -201,7 +204,11 @@ export const api = {
   checkUpdates: (game: number) => invoke<Record<string, NewMod>>("check_updates", { game }),
   update: (id: number) => invoke<string | null>("update_mod", { id }),
   events: (game: number) => invoke<ModEvent[]>("events", { game }),
-  sync: (game: number) => invoke<SyncResult>("sync_now", { game }),
+  queueSync: (game: number) => invoke<number>("queue_sync", { game }),
+  queue: () => invoke<Job[]>("queue_list"),
+  queueCancel: (id: number) => invoke<void>("queue_cancel", { id }),
+  queueRetry: (id: number) => invoke<void>("queue_retry", { id }),
+  queueClear: () => invoke<void>("queue_clear"),
   unmanaged: (game: number) => invoke<Unmanaged[]>("unmanaged", { game }),
   deleteUnmanaged: (game: number, keys: string[]) => invoke<void>("delete_unmanaged", { game, keys }),
   ignoreUnmanaged: (game: number, keys: string[], ignore = true) => invoke<void>("ignore_unmanaged", { game, keys, ignore }),
