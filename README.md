@@ -2,38 +2,47 @@
 
 # Mods Manager
 
-Keeps your and your friend's BONELAB mods **identical**: same mods, same exact files.
+Keeps everyone's mods **identical**: same mods, same exact files, for any game and any number of people.
 
-- One **shared list** in a Postgres database you both connect to.
-- Every mod on the list is **pinned to one exact file**: a mod.io modfile, a Thunderstore version, or the SHA-256 of a downloaded file. "In sync" means byte-for-byte the same, not "both on latest".
-- When one of you adds, updates or removes a mod, the other app hears it **live** (`LISTEN/NOTIFY`), shows a toast and a **Sync now** card listing exactly what to install, update or remove. Turn on *Settings → Syncing → Sync on its own* to skip the click.
-- New versions don't sneak in: **Check for updates** shows what's newer, and **Update** re-pins it for both of you.
-- The top bar shows your friend: online or not, and whether they're in sync.
-- **Activity** shows who changed what, and when.
-- Files in your mod folders that aren't on the list get flagged so you can delete them or keep them.
+- One **shared database** everyone connects to, holding any number of **games**, each with its own mod list.
+- Every mod is **pinned to one exact file**: a mod.io modfile, a Thunderstore version, or the SHA-256 of a downloaded file. "In sync" means byte-for-byte the same, not "everyone on latest".
+- When someone adds, updates or removes a mod, everyone's app hears it **live** (`LISTEN/NOTIFY`), shows a toast and a **Sync now** card listing exactly what to install, update or remove. Turn on *Settings → Syncing → Sync on its own* to skip the click.
+- New versions don't sneak in: **Check for updates** shows what's newer, and **Update** re-pins it for everyone.
+- **People**: everyone who joined, online or not, and whether they're in sync in the game you're looking at.
+- **Invite codes**: one paste sets up someone's app (database and game). The database address, API key, token and invite codes are hidden fields.
+- **Activity** shows who changed what, and when. Files in a game's folders that aren't on its list get flagged so you can delete or keep them.
+- Updates itself from GitHub releases.
 
-Built with Tauri 2 (Rust) and Vue 3, in Tessera Launcher's design (Modern and Classic looks).
+Built with Tauri 2 (Rust) and Vue 3, in Tessera Launcher's design (Modern and Classic looks). Windows only for now.
 
-## What it installs
+## Games
+
+Presets for **BONELAB**, **Blade & Sorcery** and **Lethal Company**; any other game works too. A game says where its mods come from and how code mods load:
+
+| Setting | Example |
+| --- | --- |
+| mod.io game | `bladeandsorcery` (the id is looked up for you) |
+| Thunderstore community | `lethal-company` |
+| Code mods | MelonLoader, BepInEx, or none |
 
 | Source | Paste | Goes to |
 | --- | --- | --- |
-| mod.io | `https://mod.io/g/bonelab/m/<mod>`, a mod id, or search in the app | BONELAB's Mods folder (`…\AppData\LocalLow\Stress Level Zero\BONELAB\Mods`) |
-| Thunderstore | `https://thunderstore.io/c/bonelab/p/<ns>/<name>/` | The game folder in MelonLoader's layout (`Mods/`, `Plugins/`, `UserLibs/`, `UserData/`). Dependencies come along; MelonLoader itself is left to its installer. |
-| Direct link | Any `https://…` file | Either of the two, you choose |
+| mod.io | the mod's page, a mod id, or search in the app | the game's mods folder |
+| Thunderstore | the package page | the game folder in the loader's layout: MelonLoader (`Mods/`, `Plugins/`, `UserLibs/`, `UserData/`) or BepInEx (`BepInEx/plugins/<package>/…`, like r2modman; BepInExPack itself installs into the game folder). Dependencies come along. |
+| Direct link | any `https://…` file | the mods folder or the game folder, you choose |
 
-mod.io downloads are checked against mod.io's MD5, links against the pinned SHA-256.
+mod.io downloads are checked against mod.io's MD5, links against the pinned SHA-256. Each computer sets its own folders per game (found automatically for Steam installs).
 
-## Setup (both of you)
+## Setup
 
-1. Install from [Releases](../../releases) (or build it, below).
-2. On first start enter:
-   - **Your name**: your friend sees it next to your changes.
-   - **Shared database**: the same `postgres://user:password@host:5432/db` on both computers. The app creates its tables (`mm_mods`, `mm_events`, `mm_members`); TLS is used when the server offers it.
-   - **mod.io API key**: mod.io → Account → API access. If downloads say *unauthorized*, also add an OAuth token in Settings → mod.io.
-   - BONELAB's **Mods folder** and **game folder** (found automatically for Steam installs).
+1. Install from [Releases](../../releases).
+2. Enter your name, then either paste an **invite code** from someone who already uses it, or a **Postgres address** (`postgres://user:password@host:5432/db`) everyone can reach. The app creates its tables (`mm_*`); TLS is used when the server offers it.
+3. Add your **mod.io API key** (mod.io → Account → API access) if you play games on mod.io.
+4. Add a game, or pick the one you were invited to and set its folders.
 
-Coming from the old [Mod.io-Mods-Manager](https://github.com/lephorx/Mod.io-Mods-Manager)? Point this at the same database and use *Settings → Maintenance → Import from the old manager*: it copies the mod.io and Thunderstore mods onto the new list, pinned to today's files.
+Upgrading from 0.1.0 needs nothing: the existing list becomes a BONELAB game, with your folders and installed mods, so nothing downloads again.
+
+Coming from the old [Mod.io-Mods-Manager](https://github.com/lephorx/Mod.io-Mods-Manager)? Point this at the same database and use *Settings → Maintenance → Import*.
 
 ## Development
 
@@ -41,25 +50,25 @@ Needs Node 22+, pnpm and Rust (Windows: the MSVC build tools).
 
 ```sh
 pnpm install
-pnpm dev          # the app with hot reload
+pnpm dev          # "Mods Manager Dev": its own settings, separate from the installed app
 pnpm typecheck
 pnpm test         # Rust unit tests
 ```
 
-End-to-end test (two simulated computers, real Thunderstore downloads) against a throwaway database:
+End-to-end tests (the 0.1.0 migration; three people, two games, real Thunderstore downloads) against a throwaway database:
 
 ```sh
-MM_TEST_DB=postgres://user:pass@localhost:5432/scratch cargo test --manifest-path src-tauri/Cargo.toml -- --ignored two_friends
+MM_TEST_DB=postgres://user:pass@localhost:5432/scratch cargo test --manifest-path src-tauri/Cargo.toml -- --ignored --test-threads=1
 ```
 
-It truncates the `mm_*` tables, so never point it at the real list.
+They drop the `mm_*` tables, so never point them at the real database.
 
 ## Releasing
 
 Bump the version in `package.json`, `src-tauri/Cargo.toml` and `src-tauri/tauri.conf.json`, then push a tag:
 
 ```sh
-git tag v0.1.0 && git push origin v0.1.0
+git tag -a v0.3.0 -m "What's new" && git push origin v0.3.0
 ```
 
-GitHub Actions builds the Windows installer and publishes the release.
+GitHub Actions builds the signed Windows installer and publishes the release; installed apps update themselves.

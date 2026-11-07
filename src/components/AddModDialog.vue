@@ -2,14 +2,18 @@
 import { computed, onMounted, ref, watch } from "vue";
 import { ArrowLeft, Box, Code2, Download, Link2, Loader2, Plus, Search } from "lucide-vue-next";
 import AppDialog from "./AppDialog.vue";
-import { api, type Resolved, type SearchHit, type Target } from "@/lib/api";
+import { api, LOADER_LABEL, type Resolved, type SearchHit, type Target } from "@/lib/api";
 import { refresh, runSync, store } from "@/lib/store";
 import { hideImg, bytes, SOURCE_LABEL } from "@/lib/format";
 import { errorText, toast } from "@/lib/toast";
 
 const emit = defineEmits<{ close: [] }>();
 
-const mode = ref<"search" | "link">("search");
+const game = store.overview!.game;
+const hasModio = game.modioId > 0;
+const hasLoader = game.loader !== "none";
+const loader = LOADER_LABEL[game.loader];
+const mode = ref<"search" | "link">(hasModio ? "search" : "link");
 const query = ref("");
 const hits = ref<SearchHit[]>([]);
 const searching = ref(false);
@@ -41,7 +45,7 @@ async function search() {
   searching.value = true;
   searchError.value = "";
   try {
-    const found = await api.search(query.value);
+    const found = await api.search(game.id, query.value);
     if (mine === seq) hits.value = found;
   } catch (e) {
     if (mine === seq) searchError.value = errorText(e);
@@ -53,14 +57,14 @@ watch(query, () => {
   clearTimeout(timer);
   timer = setTimeout(search, 300);
 });
-onMounted(search);
+onMounted(() => hasModio && search());
 
 async function resolve(input: string) {
   resolving.value = true;
   error.value = "";
   resolved.value = null;
   try {
-    resolved.value = await api.resolve(input, isDirectLink.value ? linkName.value : undefined, isDirectLink.value ? linkTarget.value : undefined);
+    resolved.value = await api.resolve(game.id, input, isDirectLink.value ? linkName.value : undefined, isDirectLink.value ? linkTarget.value : undefined);
   } catch (e) {
     error.value = errorText(e);
   } finally {
@@ -72,7 +76,7 @@ async function add() {
   if (!resolved.value) return;
   saving.value = true;
   try {
-    const n = await api.add([resolved.value.main, ...newDeps.value]);
+    const n = await api.add(game.id, [resolved.value.main, ...newDeps.value]);
     toast.success(n > 1 ? `${resolved.value.main.name} and ${n - 1} dependencies added for everyone` : `${resolved.value.main.name} added for everyone`);
     emit("close");
     await refresh();
@@ -104,7 +108,7 @@ async function add() {
             <div class="row" style="gap: 6px; flex-wrap: wrap">
               <span class="chip">{{ SOURCE_LABEL[resolved.main.source] }}</span>
               <span class="chip num">{{ resolved.main.version }}</span>
-              <span class="chip">{{ resolved.main.target === "code" ? "Code mod (MelonLoader)" : "Content mod" }}</span>
+              <span class="chip">{{ resolved.main.target === "code" ? `${loader} mod` : "Content mod" }}</span>
               <span v-if="resolved.main.fileSize" class="chip num">{{ bytes(resolved.main.fileSize) }}</span>
             </div>
             <p v-if="resolved.main.summary" class="hint clamp">{{ resolved.main.summary }}</p>
@@ -121,7 +125,7 @@ async function add() {
           </div>
         </div>
         <p class="hint">
-          Pins exactly this file for both of you. When the mod gets a new version, nothing changes until one of you presses Update.
+          Pins exactly this file for everyone on the list. When the mod gets a new version, nothing changes until one of you presses Update.
         </p>
         <label class="row" style="gap: 8px"><input v-model="installNow" type="checkbox" /> Install it on this computer right away</label>
       </template>
@@ -137,7 +141,7 @@ async function add() {
 
     <!-- step 1: find it -->
     <template v-else>
-      <div v-slider class="tabs" role="tablist">
+      <div v-if="hasModio" v-slider class="tabs" role="tablist">
         <button :class="{ active: mode === 'search' }" role="tab" @click="mode = 'search'"><Search /> Search mod.io</button>
         <button :class="{ active: mode === 'link' }" role="tab" @click="mode = 'link'"><Link2 /> Paste a link</button>
       </div>
@@ -145,7 +149,7 @@ async function add() {
       <template v-if="mode === 'search'">
         <label class="input-icon">
           <Search />
-          <input v-model="query" class="input" placeholder="Search BONELAB mods on mod.io" autofocus aria-label="Search mod.io" />
+          <input v-model="query" class="input" :placeholder="`Search ${game.name} mods on mod.io`" autofocus aria-label="Search mod.io" />
         </label>
         <p v-if="searchError" class="error-text selectable">{{ searchError }}</p>
         <div class="hits">
@@ -166,19 +170,23 @@ async function add() {
       <template v-else>
         <div class="field">
           <label for="mm-link">Link</label>
-          <input id="mm-link" v-model="link" class="input" placeholder="mod.io or Thunderstore page, or a direct download link" @keydown.enter="link.trim() && resolve(link)" />
-          <span class="hint">mod.io: content mods (avatars, maps, spawnables). Thunderstore: MelonLoader code mods, with their dependencies.</span>
+          <input id="mm-link" v-model="link" class="input" :placeholder="[hasModio && 'mod.io', game.thunderstore && 'Thunderstore'].filter(Boolean).join(' or ') + (hasModio || game.thunderstore ? ' page, or a direct download link' : 'A direct download link')" @keydown.enter="link.trim() && resolve(link)" />
+          <span class="hint">
+            <template v-if="hasModio">mod.io: content mods. </template>
+            <template v-if="game.thunderstore">Thunderstore ({{ game.thunderstore }}): {{ hasLoader ? `${loader} mods` : "mods" }}, with their dependencies. </template>
+            Any other link: the file is pinned by its checksum.
+          </span>
         </div>
         <template v-if="isDirectLink">
           <div class="field">
             <label for="mm-name">Name</label>
             <input id="mm-name" v-model="linkName" class="input" placeholder="From the file name if empty" />
           </div>
-          <div class="field">
+          <div v-if="hasLoader" class="field">
             <label>Goes into</label>
             <div class="choices">
-              <button class="choice" :class="{ on: linkTarget === 'content' }" @click="linkTarget = 'content'"><Box /> BONELAB Mods folder</button>
-              <button class="choice" :class="{ on: linkTarget === 'code' }" @click="linkTarget = 'code'"><Code2 /> Game folder (MelonLoader)</button>
+              <button class="choice" :class="{ on: linkTarget === 'content' }" @click="linkTarget = 'content'"><Box /> Mods folder</button>
+              <button class="choice" :class="{ on: linkTarget === 'code' }" @click="linkTarget = 'code'"><Code2 /> Game folder ({{ loader }})</button>
             </div>
           </div>
         </template>

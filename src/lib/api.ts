@@ -1,14 +1,40 @@
 import { invoke } from "@tauri-apps/api/core";
 
+export interface GamePaths {
+  contentDir: string;
+  gameDir: string;
+}
+
 export interface Settings {
   name: string;
   databaseUrl: string;
   modioApiKey: string;
   modioToken: string;
-  gameId: number;
-  modsDir: string;
-  gameDir: string;
   autoSync: boolean;
+  currentGame: number | null;
+  games: Record<string, GamePaths>;
+}
+
+export type Loader = "melonloader" | "bepinex" | "none";
+
+export interface NewGame {
+  name: string;
+  modioId: number;
+  modioSlug: string;
+  thunderstore: string;
+  loader: Loader;
+  steamDir: string;
+  contentHint: string;
+}
+
+export interface Game extends NewGame {
+  id: number;
+  createdBy: string;
+}
+
+export interface GameView extends Game {
+  mods: number;
+  paths: GamePaths;
 }
 
 export type Source = "modio" | "thunderstore" | "link";
@@ -32,6 +58,7 @@ export interface NewMod {
 
 export interface SharedMod extends NewMod {
   id: number;
+  gameId: number;
   addedBy: string;
   addedAt: string;
   updatedBy: string;
@@ -61,18 +88,21 @@ export interface PlanItem {
 export interface Member {
   name: string;
   lastSeen: string;
-  pending: number;
+  /** null: hasn't opened this game */
+  pending: number | null;
   syncedAt: string | null;
 }
 
 export interface Overview {
   me: string;
+  game: Game;
+  paths: GamePaths;
   mods: ModView[];
   plan: PlanItem[];
   members: Member[];
   unmanaged: number;
-  melon: boolean;
-  needsMelon: boolean;
+  loaderOk: boolean;
+  needsLoader: boolean;
   live: boolean;
 }
 
@@ -108,6 +138,7 @@ export interface Unmanaged {
 }
 
 export interface Progress {
+  game: number;
   index: number;
   count: number;
   name: string;
@@ -122,25 +153,46 @@ export interface SyncResult {
   failed: [string, string][];
 }
 
+export interface Invite {
+  databaseUrl: string;
+  game: number | null;
+}
+
+export const LOADER_LABEL: Record<Loader, string> = { melonloader: "MelonLoader", bepinex: "BepInEx", none: "No mod loader" };
+
 export const api = {
   settings: () => invoke<Settings>("get_settings"),
   saveSettings: (settings: Settings) => invoke<void>("save_settings", { settings }),
-  detectFolders: () => invoke<{ modsDir: string | null; gameDir: string | null }>("detect_folders"),
+  detectFolders: (steamDir: string, contentHint: string) => invoke<GamePaths>("detect_folders", { steamDir, contentHint }),
   testConnection: (url: string) => invoke<void>("test_connection", { url }),
-  overview: () => invoke<Overview>("overview"),
-  resolve: (input: string, name?: string, target?: Target) => invoke<Resolved>("resolve_mod", { input, name, target }),
-  search: (query: string) => invoke<SearchHit[]>("search_modio", { query }),
-  add: (mods: NewMod[]) => invoke<number>("add_mods", { mods }),
+  inviteCode: (game: number | null) => invoke<string>("invite_code", { game }),
+  readInvite: (code: string) => invoke<Invite>("read_invite", { code }),
+
+  presets: () => invoke<NewGame[]>("presets"),
+  games: () => invoke<GameView[]>("list_games"),
+  createGame: (game: NewGame, paths: GamePaths) => invoke<number>("create_game", { game, paths }),
+  updateGame: (id: number, game: NewGame, paths: GamePaths) => invoke<void>("update_game", { id, game, paths }),
+  setGamePaths: (id: number, paths: GamePaths) => invoke<void>("set_game_paths", { id, paths }),
+  deleteGame: (id: number) => invoke<void>("delete_game", { id }),
+  setCurrentGame: (id: number | null) => invoke<void>("set_current_game", { id }),
+
+  overview: (game: number) => invoke<Overview>("overview", { game }),
+  resolve: (game: number, input: string, name?: string, target?: Target) => invoke<Resolved>("resolve_mod", { game, input, name, target }),
+  search: (game: number, query: string) => invoke<SearchHit[]>("search_modio", { game, query }),
+  add: (game: number, mods: NewMod[]) => invoke<number>("add_mods", { game, mods }),
   remove: (id: number) => invoke<void>("remove_mod", { id }),
-  checkUpdates: () => invoke<Record<string, NewMod>>("check_updates"),
+  checkUpdates: (game: number) => invoke<Record<string, NewMod>>("check_updates", { game }),
   update: (id: number) => invoke<string | null>("update_mod", { id }),
-  events: () => invoke<ModEvent[]>("events"),
-  sync: () => invoke<SyncResult>("sync_now"),
-  unmanaged: () => invoke<Unmanaged[]>("unmanaged"),
-  deleteUnmanaged: (keys: string[]) => invoke<void>("delete_unmanaged", { keys }),
-  ignoreUnmanaged: (keys: string[], ignore = true) => invoke<void>("ignore_unmanaged", { keys, ignore }),
-  importLegacy: () => invoke<[number, string[]]>("import_legacy"),
-  openFolder: (which: "mods" | "game") => invoke<void>("open_folder", { which }),
+  events: (game: number) => invoke<ModEvent[]>("events", { game }),
+  sync: (game: number) => invoke<SyncResult>("sync_now", { game }),
+  unmanaged: (game: number) => invoke<Unmanaged[]>("unmanaged", { game }),
+  deleteUnmanaged: (game: number, keys: string[]) => invoke<void>("delete_unmanaged", { game, keys }),
+  ignoreUnmanaged: (game: number, keys: string[], ignore = true) => invoke<void>("ignore_unmanaged", { game, keys, ignore }),
+  importLegacy: (game: number) => invoke<[number, string[]]>("import_legacy", { game }),
+  openFolder: (game: number, which: "content" | "game") => invoke<void>("open_folder", { game, which }),
   openUrl: (url: string) => invoke<void>("open_url", { url }),
   version: () => invoke<string>("app_version"),
 };
+
+/** Example address for the database fields (bound, not inline: vue-tsc mis-parses the // in a static attribute). */
+export const DB_PLACEHOLDER = "postgres://user:password@host:5432/mods";

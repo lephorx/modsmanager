@@ -10,12 +10,25 @@ use std::collections::HashSet;
 use serde::Serialize;
 
 use crate::config::Settings;
-use crate::db::NewMod;
+use crate::db::{Game, NewMod};
 
 pub struct Ctx<'a> {
     pub http: &'a reqwest::Client,
     pub settings: &'a Settings,
     pub temp: &'a std::path::Path,
+    /// The game whose list this is for.
+    pub game: &'a Game,
+}
+
+impl Ctx<'_> {
+    /// Where code mods from this game go: the loader's folders, or the content folder without one.
+    pub fn code_target(&self) -> &'static str {
+        if self.game.data.loader == "none" {
+            "content"
+        } else {
+            "code"
+        }
+    }
 }
 
 /// How to download one pinned file.

@@ -6,13 +6,14 @@ import { api, type Unmanaged } from "@/lib/api";
 import { errorText, toast } from "@/lib/toast";
 
 /** Files in the mod folders that no mod on the list put there: delete them or keep them. */
+const props = defineProps<{ game: number }>();
 const emit = defineEmits<{ close: [] }>();
 const items = ref<Unmanaged[] | null>(null);
 const picked = ref<Set<string>>(new Set());
 const busy = ref(false);
 
 async function load() {
-  items.value = await api.unmanaged().catch((e) => (toast.error(errorText(e)), []));
+  items.value = await api.unmanaged(props.game).catch((e) => (toast.error(errorText(e)), []));
   picked.value = new Set(items.value.map((i) => i.key));
 }
 onMounted(load);
@@ -33,8 +34,8 @@ async function run(kind: "delete" | "keep") {
   if (!keys.length) return;
   busy.value = true;
   try {
-    if (kind === "delete") await api.deleteUnmanaged(keys);
-    else await api.ignoreUnmanaged(keys);
+    if (kind === "delete") await api.deleteUnmanaged(props.game, keys);
+    else await api.ignoreUnmanaged(props.game, keys);
     toast.success(kind === "delete" ? `Deleted ${keys.length}` : `Keeping ${keys.length}; they won't be asked about again`);
     await load();
     if (!items.value?.length) emit("close");
@@ -49,8 +50,8 @@ async function run(kind: "delete" | "keep") {
 <template>
   <AppDialog title="Not on the list" :width="600" @close="emit('close')">
     <p class="hint">
-      These are in your BONELAB mod folders, but no mod on the shared list put them there (for example mods from before, or installed by hand).
-      Your friend doesn't have them.
+      These are in this game's mod folders, but no mod on the shared list put them there (for example mods from before, or installed by hand).
+      The others don't have them.
     </p>
     <div v-if="!items" class="row hint" style="gap: 8px"><Loader2 class="spin" /> Looking…</div>
     <template v-else-if="items.length">

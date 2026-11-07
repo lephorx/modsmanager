@@ -31,27 +31,28 @@ pub fn parse(input: &str) -> Option<(String, String, Option<String>)> {
     }
 }
 
-/// MelonLoader itself is installed by its own installer, not as a mod.
+/// MelonLoader itself is installed by its own installer, not as a mod. (BepInExPack is
+/// installed like a mod: it's a plain folder for the game folder.)
 pub fn is_loader(ns: &str, name: &str) -> bool {
     ns.eq_ignore_ascii_case("LavaGang") && name.eq_ignore_ascii_case("MelonLoader")
 }
 
 async fn json(ctx: &Ctx<'_>, url: String) -> Result<Value, String> {
-    let resp = ctx.http.get(url).send().await.map_err(|e| format!("Thunderstore: {e}"))?;
-    check(resp, "Thunderstore").await?.json().await.map_err(|e| format!("Thunderstore: {e}"))
+    let resp = ctx.http.get(url).send().await.map_err(|e| format!("Thunderstore: {}", e.without_url()))?;
+    check(resp, "Thunderstore").await?.json().await.map_err(|e| format!("Thunderstore: {}", e.without_url()))
 }
 
 async fn package(ctx: &Ctx<'_>, ns: &str, name: &str) -> Result<Value, String> {
     json(ctx, format!("{BASE}/api/experimental/package/{ns}/{name}/")).await
 }
 
-fn to_new(pkg: &Value, ver: &Value) -> NewMod {
+fn to_new(ctx: &Ctx<'_>, pkg: &Value, ver: &Value) -> NewMod {
     let ns = s(&pkg["namespace"]);
     let name = s(&pkg["name"]);
     NewMod {
         source: "thunderstore".into(),
         source_id: format!("{ns}/{name}"),
-        target: "code".into(),
+        target: ctx.code_target().into(),
         name: name.replace('_', " "),
         version: s(&ver["version_number"]),
         file_ref: s(&ver["version_number"]),
@@ -78,7 +79,7 @@ pub async fn pinned(ctx: &Ctx<'_>, ns: &str, name: &str, version: Option<&str>) 
         }
         _ => pkg["latest"].clone(),
     };
-    Ok((to_new(&pkg, &ver), deps(&ver)))
+    Ok((to_new(ctx, &pkg, &ver), deps(&ver)))
 }
 
 pub async fn resolve(ctx: &Ctx<'_>, input: &str) -> Result<(NewMod, Vec<String>), String> {
@@ -93,7 +94,7 @@ pub async fn latest(ctx: &Ctx<'_>, cur: &NewMod) -> Result<Option<NewMod>, Strin
     let (ns, name) = cur.source_id.split_once('/').ok_or("Bad Thunderstore id")?;
     let pkg = package(ctx, ns, name).await?;
     let ver = &pkg["latest"];
-    Ok((s(&ver["version_number"]) != cur.file_ref).then(|| to_new(&pkg, ver)))
+    Ok((s(&ver["version_number"]) != cur.file_ref).then(|| to_new(ctx, &pkg, ver)))
 }
 
 pub fn fetch(ctx: &Ctx<'_>, cur: &NewMod) -> Fetch {

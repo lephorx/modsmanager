@@ -16,9 +16,13 @@ import {
   Trash2,
   TriangleAlert,
   Box,
+  Gamepad2,
+  FolderCog,
+  UserPlus,
 } from "lucide-vue-next";
-import { api, type Action, type ModView } from "@/lib/api";
-import { checkUpdates, refresh, runSync, store } from "@/lib/store";
+import { api, LOADER_LABEL, type Action, type ModView } from "@/lib/api";
+import { checkUpdates, currentGame, hasPaths, refresh, runSync, store } from "@/lib/store";
+import { gameDialog } from "@/lib/dialogs";
 import { ago, hideImg, bytes, count, SOURCE_LABEL } from "@/lib/format";
 import { errorText, toast } from "@/lib/toast";
 import { openSettings } from "@/lib/settingsDialog";
@@ -35,6 +39,12 @@ const confirmRemove = ref<ModView | null>(null);
 const busy = ref<Record<number, boolean>>({});
 
 const o = computed(() => store.overview);
+const game = computed(() => store.games?.find((g) => g.id === currentGame()) ?? null);
+const loader = computed(() => (o.value ? LOADER_LABEL[o.value.game.loader] : ""));
+const LOADER_HELP: Record<string, { text: string; url: string }> = {
+  melonloader: { text: "Install it with the MelonLoader installer.", url: "https://github.com/LavaGang/MelonLoader.Installer/releases/latest" },
+  bepinex: { text: "Add BepInExPack from Thunderstore to the list (Add mod), or install it by hand.", url: "https://thunderstore.io/package/bbepis/BepInExPack/" },
+};
 const mods = computed(() => o.value?.mods ?? []);
 const shown = computed(() => {
   const q = query.value.trim().toLowerCase();
@@ -126,7 +136,11 @@ function menu(m: ModView): RowMenuItem[] {
     icon: RefreshCw,
     action: () => void updateMod(m),
   });
-  items.push({ label: "Open folder", icon: FolderOpen, action: () => void api.openFolder(m.target === "code" ? "game" : "mods").catch((e) => toast.error(errorText(e))) });
+  items.push({
+    label: "Open folder",
+    icon: FolderOpen,
+    action: () => void api.openFolder(m.gameId, m.target === "code" && o.value?.game.loader !== "none" ? "game" : "content").catch((e) => toast.error(errorText(e))),
+  });
   items.push({ label: "Remove for everyone", icon: Trash2, danger: true, action: () => (confirmRemove.value = m) });
   return items;
 }
@@ -142,17 +156,17 @@ function added(m: ModView) {
   <div class="page enter">
     <div class="page-header">
       <div>
-        <h1 class="page-title">Mods</h1>
+        <h1 class="page-title">{{ game?.name ?? "Mods" }}</h1>
         <p class="page-sub">
-          {{ count(mods.length, "mod") }} on the shared list
-          <template v-if="o && !plan.length"> · this computer matches it</template>
+          <template v-if="game">{{ count(mods.length, "mod") }} on the shared list<template v-if="o && !plan.length"> · this computer matches it</template></template>
+          <template v-else>Mods you share, kept identical on every computer</template>
         </p>
       </div>
       <div class="row" style="gap: 8px">
-        <button class="btn" :disabled="store.checking || !mods.length" @click="checkUpdates()">
+        <button v-if="game" class="btn" :disabled="store.checking || !mods.length" @click="checkUpdates()">
           <RefreshCw :class="{ spin: store.checking }" /> Check for updates
         </button>
-        <button class="btn btn-primary" @click="adding = true"><Plus /> Add mod</button>
+        <button v-if="game" class="btn btn-primary" @click="adding = true"><Plus /> Add mod</button>
       </div>
     </div>
 
@@ -166,15 +180,35 @@ function added(m: ModView) {
       <button class="btn" @click="refresh()">Retry</button>
     </div>
 
+    <div v-if="store.games && !store.games.length" class="card empty">
+      <Gamepad2 />
+      <h3>No games yet</h3>
+      <p>Add the game you play together. Everyone on the database sees it, with its own mod list.</p>
+      <div class="row" style="gap: 8px">
+        <button class="btn btn-primary" @click="gameDialog.add = true"><Plus /> Add a game</button>
+      </div>
+    </div>
+
+    <section v-else-if="game && !hasPaths(game.id)" class="card sync-card">
+      <div class="row" style="gap: 14px; align-items: flex-start">
+        <span class="sync-icon"><FolderCog /></span>
+        <div class="stack" style="gap: 2px; flex: 1; min-width: 0">
+          <h2 class="card-title">Where is {{ game.name }} on this computer?</h2>
+          <span class="hint">Choose its folders once, then everything on the list installs with one click.</span>
+        </div>
+        <button class="btn btn-primary btn-lg" @click="gameDialog.paths = game"><FolderCog /> Set up folders</button>
+      </div>
+    </section>
+
     <!-- what this computer has to do to match the list -->
-    <section v-if="store.syncing || plan.length" class="card sync-card">
+    <section v-else-if="store.syncing || plan.length" class="card sync-card">
       <div class="row" style="gap: 14px; align-items: flex-start">
         <span class="sync-icon"><Download v-if="!store.syncing" /><Loader2 v-else class="spin" /></span>
         <div class="stack" style="gap: 2px; flex: 1; min-width: 0">
           <h2 class="card-title">{{ store.syncing ? "Syncing…" : `${count(plan.length, "change")} to match the list` }}</h2>
           <span class="hint">
             <template v-if="store.syncing">{{ phaseText }}</template>
-            <template v-else>Your friend changed the list, or something here doesn't match it.<template v-if="planSize"> About {{ bytes(planSize) }} to download.</template></template>
+            <template v-else>Someone changed the list, or something here doesn't match it.<template v-if="planSize"> About {{ bytes(planSize) }} to download.</template></template>
           </span>
         </div>
         <button class="btn btn-play btn-lg" :disabled="store.syncing" @click="runSync()">
@@ -206,20 +240,20 @@ function added(m: ModView) {
       </div>
     </section>
 
-    <div v-if="o?.needsMelon && !o.melon" class="card notice">
+    <div v-if="o && game && hasPaths(game.id) && o.needsLoader && !o.loaderOk && !plan.some((p) => /bepinexpack/i.test(p.key))" class="card notice">
       <TriangleAlert />
       <div class="stack" style="gap: 2px; flex: 1">
-        <strong>MelonLoader isn't installed</strong>
-        <span class="hint">Code mods on the list need MelonLoader in your BONELAB folder. Install it with the MelonLoader installer, or check the game folder in Settings.</span>
+        <strong>{{ loader }} isn't installed</strong>
+        <span class="hint">Code mods on the list need {{ loader }} in the {{ o.game.name }} folder. {{ LOADER_HELP[o.game.loader]?.text }} Or check the game folder (Edit game).</span>
       </div>
-      <button class="btn" @click="api.openUrl('https://github.com/LavaGang/MelonLoader.Installer/releases/latest')">Get MelonLoader</button>
+      <button v-if="LOADER_HELP[o.game.loader]" class="btn" @click="api.openUrl(LOADER_HELP[o.game.loader]!.url)">Get {{ loader }}</button>
     </div>
 
     <div v-if="updateCount" class="card notice notice-tint">
       <ArrowUpCircle />
       <div class="stack" style="gap: 2px; flex: 1">
         <strong>{{ count(updateCount, "mod has", "mods have") }} a newer version</strong>
-        <span class="hint">Updating pins the new file for both of you; your friend gets it on their next sync.</span>
+        <span class="hint">Updating pins the new file for everyone; the others get it on their next sync.</span>
       </div>
       <button class="btn btn-tint" @click="updateAll"><ArrowUpCircle /> Update all</button>
     </div>
@@ -228,11 +262,12 @@ function added(m: ModView) {
       <Package />
       <div class="stack" style="gap: 2px; flex: 1">
         <strong>{{ count(o.unmanaged, "item") }} in your mod folders {{ o.unmanaged === 1 ? "isn't" : "aren't" }} on the list</strong>
-        <span class="hint">Your friend doesn't have {{ o.unmanaged === 1 ? "it" : "these" }}. Delete or keep them.</span>
+        <span class="hint">The others don't have {{ o.unmanaged === 1 ? "it" : "these" }}. Delete or keep them.</span>
       </div>
       <button class="btn" @click="reviewing = true">Review</button>
     </div>
 
+    <template v-if="game">
     <div class="list-head">
       <div v-slider class="tabs" role="tablist">
         <button :class="{ active: tab === 'all' }" role="tab" @click="tab = 'all'"><Layers /> All <span class="tab-count">{{ counts.all }}</span></button>
@@ -252,7 +287,7 @@ function added(m: ModView) {
     <div v-else-if="o && !mods.length" class="card empty">
       <Layers />
       <h3>The list is empty</h3>
-      <p>Add the first mod; your friend gets it too.</p>
+      <p>Add the first mod; everyone on the list gets it too.</p>
       <button class="btn btn-primary" @click="adding = true"><Plus /> Add mod</button>
     </div>
     <div v-else-if="o && !shown.length" class="card empty">
@@ -286,12 +321,14 @@ function added(m: ModView) {
       </div>
     </div>
 
+    </template>
+
     <AddModDialog v-if="adding" @close="adding = false" />
-    <UnmanagedDialog v-if="reviewing" @close="(reviewing = false), refresh()" />
+    <UnmanagedDialog v-if="reviewing && game" :game="game.id" @close="(reviewing = false), refresh()" />
     <AppDialog v-if="confirmRemove" title="Remove for everyone?" :width="440" @close="confirmRemove = null">
       <p>
-        <strong>{{ confirmRemove.name }}</strong> comes off the shared list. Its files are deleted on this computer now, and on your friend's
-        computer on their next sync.
+        <strong>{{ confirmRemove.name }}</strong> comes off the shared list. Its files are deleted on this computer now, and on everyone
+        else's computer on their next sync.
       </p>
       <div class="dialog-footer">
         <button class="btn" @click="confirmRemove = null">Cancel</button>

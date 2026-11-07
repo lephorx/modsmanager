@@ -1,0 +1,5 @@
+{
+  "identifier": "dev.lephor.modsmanager.dev",
+  "productName": "Mods Manager Dev",
+  "app": { "windows": [{ "label": "main", "title": "Mods Manager (dev)", "width": 1200, "height": 800, "minWidth": 900, "minHeight": 600 }] }
+}

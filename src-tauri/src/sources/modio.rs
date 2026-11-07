@@ -1,4 +1,4 @@
-//! mod.io: BONELAB's content mods (avatars, levels, spawnables).
+//! mod.io: content mods (avatars, maps, items…) for any game on mod.io.
 
 use serde_json::Value;
 
@@ -9,7 +9,15 @@ const API: &str = "https://api.mod.io/v1";
 
 fn get(ctx: &Ctx<'_>, path: &str) -> Result<reqwest::RequestBuilder, String> {
     let st = ctx.settings;
-    let req = ctx.http.get(format!("{API}/games/{}{path}", st.game_id));
+    let game = ctx.game.data.modio_id;
+    if game <= 0 {
+        return Err(format!("{} isn't set up for mod.io (Edit game → mod.io)", ctx.game.data.name));
+    }
+    let req = ctx.http.get(format!("{API}/games/{game}{path}"));
+    auth(st, req)
+}
+
+fn auth(st: &crate::config::Settings, req: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder, String> {
     if !st.modio_token.trim().is_empty() {
         Ok(req.bearer_auth(st.modio_token.trim()))
     } else if !st.modio_api_key.trim().is_empty() {
@@ -20,8 +28,9 @@ fn get(ctx: &Ctx<'_>, path: &str) -> Result<reqwest::RequestBuilder, String> {
 }
 
 async fn json(req: reqwest::RequestBuilder, what: &str) -> Result<Value, String> {
-    let resp = req.send().await.map_err(|e| format!("{what}: {e}"))?;
-    check(resp, what).await?.json().await.map_err(|e| format!("{what}: {e}"))
+    // without_url: the URL carries the API key, which never goes into an error message
+    let resp = req.send().await.map_err(|e| format!("{what}: {}", e.without_url()))?;
+    check(resp, what).await?.json().await.map_err(|e| format!("{what}: {}", e.without_url()))
 }
 
 async fn find(ctx: &Ctx<'_>, input: &str) -> Result<Value, String> {
@@ -37,9 +46,9 @@ async fn find(ctx: &Ctx<'_>, input: &str) -> Result<Value, String> {
             let i = segs.iter().position(|p| p == "m")?;
             segs.get(i + 1).cloned()
         })
-        .ok_or("That doesn't look like a mod.io mod link (…/g/bonelab/m/<mod>)")?;
+        .ok_or("That doesn't look like a mod.io mod link (…/g/<game>/m/<mod>)")?;
     let list = json(get(ctx, "/mods")?.query(&[("name_id", name_id.as_str())]), "mod.io").await?;
-    list["data"].get(0).cloned().ok_or_else(|| format!("mod.io has no BONELAB mod called \"{name_id}\""))
+    list["data"].get(0).cloned().ok_or_else(|| format!("mod.io has no {} mod called \"{name_id}\"", ctx.game.data.name))
 }
 
 /// The file people get today: the Windows build when the mod has per-platform files.
@@ -129,4 +138,24 @@ pub async fn search(ctx: &Ctx<'_>, query: &str) -> Result<Vec<SearchHit>, String
                 .collect()
         })
         .unwrap_or_default())
+}
+
+/// The mod.io game id for `mod.io/g/<slug>` (a slug, a game link or a number).
+pub async fn game_id(http: &reqwest::Client, settings: &crate::config::Settings, input: &str) -> Result<(i64, String), String> {
+    let input = input.trim().trim_end_matches('/');
+    if let Ok(id) = input.parse::<i64>() {
+        return Ok((id, String::new()));
+    }
+    let slug = url::Url::parse(input)
+        .ok()
+        .and_then(|u| {
+            let segs: Vec<String> = u.path_segments()?.map(str::to_string).collect();
+            let i = segs.iter().position(|p| p == "g")?;
+            segs.get(i + 1).cloned()
+        })
+        .unwrap_or_else(|| input.to_string());
+    let req = auth(settings, http.get(format!("{API}/games")).query(&[("name_id", slug.as_str())]))?;
+    let list = json(req, "mod.io").await?;
+    let g = list["data"].get(0).ok_or_else(|| format!("mod.io has no game called \"{slug}\""))?;
+    Ok((g["id"].as_i64().unwrap_or(0), slug))
 }

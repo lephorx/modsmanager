@@ -1,5 +1,5 @@
-//! Mods Manager: one shared list of exact mod files, and a Sync button that makes
-//! this computer match it.
+//! Mods Manager: shared lists of exact mod files, one per game, and a Sync button that makes
+//! this computer match the list.
 
 mod config;
 mod db;
@@ -7,20 +7,21 @@ mod install;
 mod sources;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
 use futures_util::StreamExt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 use tokio::sync::{Mutex, RwLock};
 use tokio_postgres::Client;
 
-use config::{Installed, Local, Root, Settings};
-use db::{Event, Member, NewMod, SharedMod};
+use config::{GamePaths, Installed, Local, LocalGame, Root, Settings};
+use db::{Event, Game, Member, NewGame, NewMod, SharedMod};
 use sources::{AddOptions, Ctx, Resolved, SearchHit};
 
 type R<T> = Result<T, String>;
@@ -36,6 +37,8 @@ pub struct AppState {
     listener: std::sync::Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     /// Live updates are connected (also sent as the `live` event).
     live: AtomicBool,
+    /// v0.1.0's local data was looked at this run.
+    local_migrated: AtomicBool,
 }
 
 impl AppState {
@@ -47,19 +50,64 @@ impl AppState {
     }
 
     async fn db(&self) -> R<Arc<Client>> {
-        let mut slot = self.db.lock().await;
-        if let Some(c) = slot.as_ref() {
-            if !c.is_closed() {
-                return Ok(c.clone());
+        let client = {
+            let mut slot = self.db.lock().await;
+            match slot.as_ref() {
+                Some(c) if !c.is_closed() => c.clone(),
+                _ => {
+                    let url = self.settings.read().await.database_url.clone();
+                    if url.trim().is_empty() {
+                        return Err("Set up the shared database in Settings first".into());
+                    }
+                    let c = Arc::new(db::connect(&url).await?);
+                    *slot = Some(c.clone());
+                    c
+                }
+            }
+        };
+        if !self.local_migrated.swap(true, Ordering::SeqCst) {
+            if let Err(e) = self.migrate_local(&client).await {
+                self.local_migrated.store(false, Ordering::SeqCst);
+                return Err(format!("Moving your BONELAB setup to the new version failed: {e}"));
             }
         }
-        let url = self.settings.read().await.database_url.clone();
-        if url.trim().is_empty() {
-            return Err("Set up the shared database in Settings first".into());
+        Ok(client)
+    }
+
+    /// v0.1.0 had one game (BONELAB): its folders and installed mods become the BONELAB game's,
+    /// so nothing downloads again.
+    async fn migrate_local(&self, client: &Client) -> R<()> {
+        let mut settings = self.settings.write().await;
+        let mut local = self.local.lock().await;
+        let old_folders = !settings.mods_dir.is_empty() || !settings.game_dir.is_empty();
+        let old_installs = !local.installed.is_empty() || !local.ignored.is_empty();
+        if !old_folders && !old_installs {
+            return Ok(());
         }
-        let c = Arc::new(db::connect(&url).await?);
-        *slot = Some(c.clone());
-        Ok(c)
+        let id = db::bonelab(client).await?;
+        if old_folders {
+            let (content, game) = (std::mem::take(&mut settings.mods_dir), std::mem::take(&mut settings.game_dir));
+            let paths = settings.games.entry(id).or_default();
+            if paths.content_dir.is_empty() {
+                paths.content_dir = content;
+            }
+            if paths.game_dir.is_empty() {
+                paths.game_dir = game;
+            }
+            settings.current_game.get_or_insert(id);
+        }
+        if old_installs {
+            let installed = std::mem::take(&mut local.installed);
+            let ignored = std::mem::take(&mut local.ignored);
+            let game = local.game_mut(id);
+            game.installed.extend(installed);
+            game.ignored.extend(ignored.into_iter().map(|k| match k.strip_prefix("mods/") {
+                Some(rest) => format!("content/{rest}"),
+                None => k,
+            }));
+        }
+        config::save(&self.local_path(), &*local)?;
+        config::save(&self.settings_path(), &*settings)
     }
 
     async fn save_local(&self, local: &Local) -> R<()> {
@@ -69,9 +117,22 @@ impl AppState {
     async fn me(&self) -> String {
         self.settings.read().await.name.trim().to_string()
     }
+
+    /// Everything a command about one game needs.
+    async fn game(&self, id: i64) -> R<(Arc<Client>, Settings, Game, GamePaths)> {
+        let db = self.db().await?;
+        let game = db::game(&db, id).await?;
+        let settings = self.settings.read().await.clone();
+        let paths = settings.paths(id);
+        Ok((db, settings, game, paths))
+    }
+
+    fn ctx<'a>(&'a self, settings: &'a Settings, game: &'a Game) -> Ctx<'a> {
+        Ctx { http: &self.http, settings, temp: &self.temp, game }
+    }
 }
 
-// ── the plan: what this computer has to do to match the list ──────────────
+// ── the plan: what this computer has to do to match a game's list ─────────
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -97,20 +158,20 @@ pub struct PlanItem {
     target: String,
 }
 
-fn state_of(settings: &Settings, local: &Local, m: &SharedMod) -> &'static str {
+fn state_of(paths: &GamePaths, local: &LocalGame, m: &SharedMod) -> &'static str {
     match local.installed.get(&m.data.key()) {
         None => "missing",
         Some(i) if i.pin != m.data.pin() => "outdated",
-        Some(i) if !install::is_present(settings, i) => "broken",
+        Some(i) if !install::is_present(paths, i) => "broken",
         Some(_) => "installed",
     }
 }
 
-fn plan(settings: &Settings, local: &Local, mods: &[SharedMod]) -> Vec<PlanItem> {
+fn plan(paths: &GamePaths, local: &LocalGame, mods: &[SharedMod]) -> Vec<PlanItem> {
     let mut out = Vec::new();
     for m in mods {
         let inst = local.installed.get(&m.data.key());
-        let action = match state_of(settings, local, m) {
+        let action = match state_of(paths, local, m) {
             "missing" => "install",
             "outdated" => "update",
             "broken" => "repair",
@@ -148,13 +209,26 @@ fn plan(settings: &Settings, local: &Local, mods: &[SharedMod]) -> Vec<PlanItem>
 #[serde(rename_all = "camelCase")]
 pub struct Overview {
     me: String,
+    game: Game,
+    paths: GamePaths,
     mods: Vec<ModView>,
     plan: Vec<PlanItem>,
     members: Vec<Member>,
     unmanaged: usize,
-    melon: bool,
-    needs_melon: bool,
+    /// The game's mod loader is in its folder (true without a loader)
+    loader_ok: bool,
+    /// Code mods are on the list, so the loader is needed
+    needs_loader: bool,
     live: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GameView {
+    #[serde(flatten)]
+    game: Game,
+    mods: i64,
+    paths: GamePaths,
 }
 
 // ── commands: settings ─────────────────────────────────────────────────────
@@ -177,8 +251,8 @@ async fn save_settings(app: AppHandle, state: State<'_, AppState>, settings: Set
 }
 
 #[tauri::command]
-fn detect_folders() -> config::Detected {
-    config::detect()
+fn detect_folders(steam_dir: String, content_hint: String) -> GamePaths {
+    config::detect(&steam_dir, &content_hint)
 }
 
 #[tauri::command]
@@ -186,35 +260,171 @@ async fn test_connection(url: String) -> R<()> {
     db::connect(&url).await.map(|_| ())
 }
 
-// ── commands: the list ─────────────────────────────────────────────────────
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Invite {
+    database_url: String,
+    game: Option<i64>,
+}
+
+const INVITE_PREFIX: &str = "MM1-";
+
+/// A code that sets up someone else's app: the database (with its password) and a game.
+#[tauri::command]
+async fn invite_code(state: State<'_, AppState>, game: Option<i64>) -> R<String> {
+    let url = state.settings.read().await.database_url.clone();
+    if url.trim().is_empty() {
+        return Err("Set up the shared database first".into());
+    }
+    let json = serde_json::to_vec(&Invite { database_url: url, game }).map_err(|e| e.to_string())?;
+    Ok(format!("{INVITE_PREFIX}{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json)))
+}
 
 #[tauri::command]
-async fn overview(state: State<'_, AppState>) -> R<Overview> {
+fn read_invite(code: String) -> R<Invite> {
+    let body = code.trim().strip_prefix(INVITE_PREFIX).ok_or("That isn't an invite code (they start with MM1-)")?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(body).map_err(|_| "That invite code is damaged; copy it again")?;
+    serde_json::from_slice(&bytes).map_err(|_| "That invite code is damaged; copy it again".to_string())
+}
+
+// ── commands: games ────────────────────────────────────────────────────────
+
+#[tauri::command]
+fn presets() -> Vec<NewGame> {
+    db::presets()
+}
+
+#[tauri::command]
+async fn list_games(state: State<'_, AppState>) -> R<Vec<GameView>> {
     let db = state.db().await?;
     let settings = state.settings.read().await.clone();
-    let mods = db::list_mods(&db).await?;
-    let local = state.local.lock().await.clone();
-    let plan = plan(&settings, &local, &mods);
+    let counts = db::mod_counts(&db).await?;
+    Ok(db::games(&db)
+        .await?
+        .into_iter()
+        .map(|g| GameView { mods: counts.get(&g.id).copied().unwrap_or(0), paths: settings.paths(g.id), game: g })
+        .collect())
+}
+
+/// Cleans up what was typed and fills in the mod.io game id from its slug (mod.io/g/<slug>).
+async fn with_modio_id(state: &AppState, mut game: NewGame) -> R<NewGame> {
+    game.name = game.name.trim().to_string();
+    if game.name.is_empty() {
+        return Err("Give the game a name".into());
+    }
+    if !["melonloader", "bepinex", "none"].contains(&game.loader.as_str()) {
+        game.loader = "none".into();
+    }
+    // a pasted community link: thunderstore.io/c/<community>/…
+    let ts = game.thunderstore.trim().trim_end_matches('/');
+    game.thunderstore = ts.rsplit("/c/").next().unwrap_or("").split('/').next().unwrap_or("").to_string();
+    let slug = game.modio_slug.trim().to_string();
+    if slug.is_empty() {
+        game.modio_id = 0;
+        game.modio_slug.clear();
+    } else if game.modio_id <= 0 || slug.contains('/') {
+        let settings = state.settings.read().await.clone();
+        let (id, found) = sources::modio::game_id(&state.http, &settings, &slug)
+            .await
+            .map_err(|e| format!("Looking up the game on mod.io: {e}"))?;
+        game.modio_id = id;
+        if !found.is_empty() {
+            game.modio_slug = found;
+        }
+    }
+    Ok(game)
+}
+
+#[tauri::command]
+async fn create_game(state: State<'_, AppState>, game: NewGame, paths: GamePaths) -> R<i64> {
+    let game = with_modio_id(&state, game).await?;
+    let db = state.db().await?;
+    let me = state.me().await;
+    let id = db::insert_game(&db, &game, &me).await?;
+    db::notify(&db, id, &me, "game", &game.name).await?;
+    let mut settings = state.settings.write().await;
+    settings.games.insert(id, paths);
+    settings.current_game = Some(id);
+    config::save(&state.settings_path(), &*settings)?;
+    Ok(id)
+}
+
+#[tauri::command]
+async fn update_game(state: State<'_, AppState>, id: i64, game: NewGame, paths: GamePaths) -> R<()> {
+    let game = with_modio_id(&state, game).await?;
+    let db = state.db().await?;
+    db::update_game(&db, id, &game).await?;
+    let me = state.me().await;
+    db::notify(&db, id, &me, "game", &game.name).await?;
+    let mut settings = state.settings.write().await;
+    settings.games.insert(id, paths);
+    config::save(&state.settings_path(), &*settings)
+}
+
+/// Saves where a game lives on this computer (nothing shared changes).
+#[tauri::command]
+async fn set_game_paths(state: State<'_, AppState>, id: i64, paths: GamePaths) -> R<()> {
+    let mut settings = state.settings.write().await;
+    settings.games.insert(id, paths);
+    config::save(&state.settings_path(), &*settings)
+}
+
+/// Removes the game and its list for everyone. Installed files stay where they are.
+#[tauri::command]
+async fn delete_game(state: State<'_, AppState>, id: i64) -> R<()> {
+    let db = state.db().await?;
+    let game = db::game(&db, id).await?;
+    db::delete_game(&db, id).await?;
+    let me = state.me().await;
+    db::notify(&db, id, &me, "game-removed", &game.data.name).await?;
+    let mut settings = state.settings.write().await;
+    settings.games.remove(&id);
+    if settings.current_game == Some(id) {
+        settings.current_game = None;
+    }
+    config::save(&state.settings_path(), &*settings)?;
+    let mut local = state.local.lock().await;
+    local.games.remove(&id);
+    state.save_local(&local).await
+}
+
+#[tauri::command]
+async fn set_current_game(state: State<'_, AppState>, id: Option<i64>) -> R<()> {
+    let mut settings = state.settings.write().await;
+    settings.current_game = id;
+    config::save(&state.settings_path(), &*settings)
+}
+
+// ── commands: a game's list ────────────────────────────────────────────────
+
+#[tauri::command]
+async fn overview(state: State<'_, AppState>, game: i64) -> R<Overview> {
+    let (db, settings, g, paths) = state.game(game).await?;
+    let mods = db::list_mods(&db, game).await?;
+    let local = state.local.lock().await.game(game);
+    let plan = plan(&paths, &local, &mods);
     let me = settings.name.trim().to_string();
     if !me.is_empty() {
-        db::heartbeat(&db, &me, plan.len() as i32, plan.is_empty()).await?;
+        db::heartbeat(&db, &me, game, plan.len() as i32, plan.is_empty()).await?;
     }
-    let members = db::members(&db).await?;
+    let members = db::members(&db, game).await?;
     let views = mods
         .into_iter()
         .map(|m| {
-            let st = state_of(&settings, &local, &m);
+            let st = state_of(&paths, &local, &m);
             let local_version = local.installed.get(&m.data.key()).map(|i| i.version.clone());
             ModView { m, state: st, local_version }
         })
         .collect::<Vec<_>>();
-    let needs_melon = views.iter().any(|v| v.m.data.target == "code");
+    let needs_loader = g.data.loader != "none" && views.iter().any(|v| v.m.data.target == "code");
     Ok(Overview {
         me,
-        unmanaged: install::unmanaged(&settings, &local).len(),
-        melon: install::melon_installed(&settings),
-        needs_melon,
+        unmanaged: install::unmanaged(&paths, &g.data.loader, &local).len(),
+        loader_ok: install::loader_installed(&paths, &g.data.loader),
+        needs_loader,
         live: state.live.load(Ordering::Relaxed),
+        game: g,
+        paths,
         mods: views,
         plan,
         members,
@@ -222,30 +432,28 @@ async fn overview(state: State<'_, AppState>) -> R<Overview> {
 }
 
 #[tauri::command]
-async fn resolve_mod(state: State<'_, AppState>, input: String, name: Option<String>, target: Option<String>) -> R<Resolved> {
-    let settings = state.settings.read().await.clone();
-    let ctx = Ctx { http: &state.http, settings: &settings, temp: &state.temp };
+async fn resolve_mod(state: State<'_, AppState>, game: i64, input: String, name: Option<String>, target: Option<String>) -> R<Resolved> {
+    let (_, settings, g, _) = state.game(game).await?;
     let opts = AddOptions { name: name.unwrap_or_default(), target: target.unwrap_or_else(|| "content".into()) };
-    sources::resolve(&ctx, &input, &opts).await
+    sources::resolve(&state.ctx(&settings, &g), &input, &opts).await
 }
 
 #[tauri::command]
-async fn search_modio(state: State<'_, AppState>, query: String) -> R<Vec<SearchHit>> {
-    let settings = state.settings.read().await.clone();
-    let ctx = Ctx { http: &state.http, settings: &settings, temp: &state.temp };
-    sources::modio::search(&ctx, &query).await
+async fn search_modio(state: State<'_, AppState>, game: i64, query: String) -> R<Vec<SearchHit>> {
+    let (_, settings, g, _) = state.game(game).await?;
+    sources::modio::search(&state.ctx(&settings, &g), &query).await
 }
 
-/// Puts mods on the shared list; returns how many were new.
+/// Puts mods on a game's list; returns how many were new.
 #[tauri::command]
-async fn add_mods(state: State<'_, AppState>, mods: Vec<NewMod>) -> R<usize> {
+async fn add_mods(state: State<'_, AppState>, game: i64, mods: Vec<NewMod>) -> R<usize> {
     let db = state.db().await?;
     let me = state.me().await;
     let mut added = 0;
     for m in &mods {
-        if db::insert_mod(&db, m, &me).await? {
+        if db::insert_mod(&db, game, m, &me).await? {
             added += 1;
-            db::record(&db, &me, "add", &m.name, &m.version).await?;
+            db::record(&db, game, &me, "add", &m.name, &m.version).await?;
         }
     }
     Ok(added)
@@ -258,21 +466,20 @@ async fn remove_mod(state: State<'_, AppState>, id: i64) -> R<()> {
     let me = state.me().await;
     let m = db::get_mod(&db, id).await?;
     db::delete_mod(&db, id).await?;
-    db::record(&db, &me, "remove", &m.data.name, &m.data.version).await
+    db::record(&db, m.game_id, &me, "remove", &m.data.name, &m.data.version).await
 }
 
-/// Newer files for the mods on the list (links aren't checked: that would download them all).
+/// Newer files for the mods on a list (links aren't checked: that would download them all).
 #[tauri::command]
-async fn check_updates(state: State<'_, AppState>) -> R<HashMap<i64, NewMod>> {
-    let db = state.db().await?;
-    let settings = state.settings.read().await.clone();
-    let mods = db::list_mods(&db).await?;
+async fn check_updates(state: State<'_, AppState>, game: i64) -> R<HashMap<i64, NewMod>> {
+    let (db, settings, g, _) = state.game(game).await?;
+    let mods = db::list_mods(&db, game).await?;
     // each lookup owns what it needs: borrowed futures in a stream trip up the command's Send bound
-    let settings = Arc::new(settings);
+    let (settings, g) = (Arc::new(settings), Arc::new(g));
     let lookups = mods.into_iter().map(|m| {
-        let (http, settings, temp) = (state.http.clone(), settings.clone(), state.temp.clone());
+        let (http, settings, temp, g) = (state.http.clone(), settings.clone(), state.temp.clone(), g.clone());
         tauri::async_runtime::spawn(async move {
-            let ctx = Ctx { http: &http, settings: &settings, temp: &temp };
+            let ctx = Ctx { http: &http, settings: &settings, temp: &temp, game: &g };
             (m.id, sources::latest(&ctx, &m.data, false).await)
         })
     });
@@ -300,24 +507,23 @@ async fn check_updates(state: State<'_, AppState>) -> R<HashMap<i64, NewMod>> {
     Ok(out)
 }
 
-/// Re-pins a mod to its newest file (or the one given), for everyone.
+/// Re-pins a mod to its newest file, for everyone.
 #[tauri::command]
 async fn update_mod(state: State<'_, AppState>, id: i64) -> R<Option<String>> {
     let db = state.db().await?;
-    let settings = state.settings.read().await.clone();
-    let me = settings.name.trim().to_string();
     let cur = db::get_mod(&db, id).await?;
-    let ctx = Ctx { http: &state.http, settings: &settings, temp: &state.temp };
-    let Some(next) = sources::latest(&ctx, &cur.data, true).await? else { return Ok(None) };
+    let (_, settings, g, _) = state.game(cur.game_id).await?;
+    let me = settings.name.trim().to_string();
+    let Some(next) = sources::latest(&state.ctx(&settings, &g), &cur.data, true).await? else { return Ok(None) };
     db::repin(&db, id, &next, &me).await?;
-    db::record(&db, &me, "update", &next.name, &format!("{} -> {}", cur.data.version, next.version)).await?;
+    db::record(&db, cur.game_id, &me, "update", &next.name, &format!("{} -> {}", cur.data.version, next.version)).await?;
     Ok(Some(next.version))
 }
 
 #[tauri::command]
-async fn events(state: State<'_, AppState>) -> R<Vec<Event>> {
+async fn events(state: State<'_, AppState>, game: i64) -> R<Vec<Event>> {
     let db = state.db().await?;
-    db::events(&db, 300).await
+    db::events(&db, game, 300).await
 }
 
 // ── commands: sync ─────────────────────────────────────────────────────────
@@ -325,6 +531,7 @@ async fn events(state: State<'_, AppState>) -> R<Vec<Event>> {
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct Progress {
+    game: i64,
     index: usize,
     count: usize,
     name: String,
@@ -342,15 +549,34 @@ pub struct SyncResult {
     failed: Vec<(String, String)>,
 }
 
-async fn install_one(emit: &(dyn Fn(Progress) + Send + Sync), state: &AppState, settings: &Settings, m: &SharedMod, old: Option<Installed>, progress: Progress) -> R<Installed> {
-    let code = m.data.target == "code";
-    if code && settings.game_dir.trim().is_empty() {
-        return Err("Set your BONELAB game folder in Settings (code mods go there)".into());
+/// The folder a code mod gets for itself (BepInEx plugins): Thunderstore's `Namespace-Name`.
+fn package_name(m: &NewMod) -> String {
+    if m.source == "thunderstore" {
+        m.source_id.replace('/', "-")
+    } else {
+        install::sanitize(&m.name)
     }
-    if !code && settings.mods_dir.trim().is_empty() {
-        return Err("Set your BONELAB Mods folder in Settings".into());
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn install_one(
+    emit: &(dyn Fn(Progress) + Send + Sync),
+    state: &AppState,
+    settings: &Settings,
+    game: &Game,
+    paths: &GamePaths,
+    m: &SharedMod,
+    old: Option<Installed>,
+    progress: Progress,
+) -> R<Installed> {
+    let code = m.data.target == "code" && game.data.loader != "none";
+    if code && paths.game_dir.trim().is_empty() {
+        return Err(format!("Set the {} game folder first (Edit game): code mods go there", game.data.name));
     }
-    let ctx = Ctx { http: &state.http, settings, temp: &state.temp };
+    if !code && paths.content_dir.trim().is_empty() {
+        return Err(format!("Set the {} mods folder first (Edit game)", game.data.name));
+    }
+    let ctx = state.ctx(settings, game);
     let fetch = sources::fetch(&ctx, &m.data).await?;
     let file = state.temp.join(format!("dl-{}", m.id));
     let staging = state.temp.join(format!("unpack-{}", m.id));
@@ -370,19 +596,18 @@ async fn install_one(emit: &(dyn Fn(Progress) + Send + Sync), state: &AppState, 
         }
     };
     emit(Progress { phase: "installing", done: 0, total: 0, ..progress.clone() });
-    let settings2 = settings.clone();
-    let name = m.data.name.clone();
+    let (paths2, loader, package, name) = (paths.clone(), game.data.loader.clone(), package_name(&m.data), m.data.name.clone());
     let (file2, staging2) = (file.clone(), staging.clone());
     let placed = tauri::async_runtime::spawn_blocking(move || -> R<(Root, Vec<String>)> {
         install::unpack(&file2, &got.file_name, &staging2)?;
         // take the old version out first, so renamed folders don't stay behind
         if let Some(old) = &old {
-            install::remove(&settings2, old)?;
+            install::remove(&paths2, old)?;
         }
         if code {
-            Ok((Root::Game, install::place_code(&staging2, std::path::Path::new(&settings2.game_dir))?))
+            Ok((Root::Game, install::place_code(&staging2, Path::new(&paths2.game_dir), &loader, &package)?))
         } else {
-            Ok((Root::Mods, install::place_content(&staging2, std::path::Path::new(&settings2.mods_dir), &name)?))
+            Ok((Root::Content, install::place_content(&staging2, Path::new(&paths2.content_dir), &name)?))
         }
     })
     .await
@@ -390,50 +615,46 @@ async fn install_one(emit: &(dyn Fn(Progress) + Send + Sync), state: &AppState, 
     .and_then(|r| r);
     let _ = std::fs::remove_file(&file);
     let _ = std::fs::remove_dir_all(&staging);
-    let (root, paths) = placed?;
-    Ok(Installed { name: m.data.name.clone(), pin: m.data.pin(), version: m.data.version.clone(), root, paths, installed_at: chrono::Utc::now() })
+    let (root, placed) = placed?;
+    Ok(Installed { name: m.data.name.clone(), pin: m.data.pin(), version: m.data.version.clone(), root, paths: placed, installed_at: chrono::Utc::now() })
 }
 
-#[tauri::command]
-async fn sync_now(app: AppHandle, state: State<'_, AppState>) -> R<SyncResult> {
+/// Makes this computer match one game's list. `emit` reports progress.
+async fn run_sync(state: &AppState, game: i64, emit: &(dyn Fn(Progress) + Send + Sync)) -> R<SyncResult> {
     let _running = state.sync_lock.try_lock().map_err(|_| "A sync is already running".to_string())?;
-    let db = state.db().await?;
-    let settings = state.settings.read().await.clone();
-    let mods = db::list_mods(&db).await?;
-    let items = plan(&settings, &*state.local.lock().await, &mods);
+    let (db, settings, g, paths) = state.game(game).await?;
+    let mods = db::list_mods(&db, game).await?;
+    let items = plan(&paths, &state.local.lock().await.game(game), &mods);
     let count = items.len();
-    let app2 = app.clone();
-    let emit = move |p: Progress| {
-        let _ = app2.emit("sync-progress", p);
-    };
     let mut result = SyncResult { done: 0, failed: vec![] };
     for (index, item) in items.iter().enumerate() {
-        let progress = Progress { index, count, name: item.name.clone(), action: item.action, phase: "removing", done: 0, total: 0 };
-        let old = state.local.lock().await.installed.get(&item.key).cloned();
+        let progress = Progress { game, index, count, name: item.name.clone(), action: item.action, phase: "removing", done: 0, total: 0 };
+        let old = state.local.lock().await.game(game).installed.get(&item.key).cloned();
         let outcome: R<Option<Installed>> = if item.action == "remove" {
-            let _ = app.emit("sync-progress", progress.clone());
+            emit(progress.clone());
             match old {
                 Some(old) => {
-                    let s = settings.clone();
-                    tauri::async_runtime::spawn_blocking(move || install::remove(&s, &old)).await.map_err(|e| e.to_string()).and_then(|r| r).map(|_| None)
+                    let p = paths.clone();
+                    tauri::async_runtime::spawn_blocking(move || install::remove(&p, &old)).await.map_err(|e| e.to_string()).and_then(|r| r).map(|_| None)
                 }
                 None => Ok(None),
             }
         } else {
             match mods.iter().find(|m| Some(m.id) == item.id) {
-                Some(m) => install_one(&emit, &state, &settings, m, old, progress.clone()).await.map(Some),
+                Some(m) => install_one(emit, state, &settings, &g, &paths, m, old, progress.clone()).await.map(Some),
                 None => Ok(None),
             }
         };
         match outcome {
             Ok(installed) => {
                 let mut local = state.local.lock().await;
+                let lg = local.game_mut(game);
                 match installed {
                     Some(i) => {
-                        local.installed.insert(item.key.clone(), i);
+                        lg.installed.insert(item.key.clone(), i);
                     }
                     None => {
-                        local.installed.remove(&item.key);
+                        lg.installed.remove(&item.key);
                     }
                 }
                 state.save_local(&local).await?;
@@ -442,56 +663,64 @@ async fn sync_now(app: AppHandle, state: State<'_, AppState>) -> R<SyncResult> {
             Err(e) => result.failed.push((item.name.clone(), e)),
         }
     }
-    let _ = app.emit("sync-progress", Progress { index: count, count, name: String::new(), action: "install", phase: "done", done: 0, total: 0 });
+    emit(Progress { game, index: count, count, name: String::new(), action: "install", phase: "done", done: 0, total: 0 });
     let me = settings.name.trim();
     if !me.is_empty() {
-        db::heartbeat(&db, me, result.failed.len() as i32, result.failed.is_empty()).await?;
+        db::heartbeat(&db, me, game, result.failed.len() as i32, result.failed.is_empty()).await?;
         if count > 0 {
-            db::notify(&db, me, "synced", "").await?;
+            db::notify(&db, game, me, "synced", "").await?;
         }
     }
     Ok(result)
 }
 
+#[tauri::command]
+async fn sync_now(app: AppHandle, state: State<'_, AppState>, game: i64) -> R<SyncResult> {
+    let emit = move |p: Progress| {
+        let _ = app.emit("sync-progress", p);
+    };
+    run_sync(&state, game, &emit).await
+}
+
 // ── commands: housekeeping ─────────────────────────────────────────────────
 
 #[tauri::command]
-async fn unmanaged(state: State<'_, AppState>) -> R<Vec<install::Unmanaged>> {
-    let settings = state.settings.read().await.clone();
-    let local = state.local.lock().await.clone();
-    Ok(install::unmanaged(&settings, &local))
+async fn unmanaged(state: State<'_, AppState>, game: i64) -> R<Vec<install::Unmanaged>> {
+    let (_, _, g, paths) = state.game(game).await?;
+    let local = state.local.lock().await.game(game);
+    Ok(install::unmanaged(&paths, &g.data.loader, &local))
 }
 
 #[tauri::command]
-async fn delete_unmanaged(state: State<'_, AppState>, keys: Vec<String>) -> R<()> {
-    let settings = state.settings.read().await.clone();
+async fn delete_unmanaged(state: State<'_, AppState>, game: i64, keys: Vec<String>) -> R<()> {
+    let paths = state.settings.read().await.paths(game);
     for key in keys {
-        install::delete_unmanaged(&settings, &key)?;
+        install::delete_unmanaged(&paths, &key)?;
     }
     Ok(())
 }
 
 #[tauri::command]
-async fn ignore_unmanaged(state: State<'_, AppState>, keys: Vec<String>, ignore: bool) -> R<()> {
+async fn ignore_unmanaged(state: State<'_, AppState>, game: i64, keys: Vec<String>, ignore: bool) -> R<()> {
     let mut local = state.local.lock().await;
+    let lg = local.game_mut(game);
     for key in keys {
         if ignore {
-            local.ignored.insert(key);
+            lg.ignored.insert(key);
         } else {
-            local.ignored.remove(&key);
+            lg.ignored.remove(&key);
         }
     }
     state.save_local(&local).await
 }
 
-/// Copies the list from the old Mod.io-Mods-Manager tables (pinned to today's files).
+/// Copies the list from the old Mod.io-Mods-Manager tables onto a game (pinned to today's files).
 #[tauri::command]
-async fn import_legacy(state: State<'_, AppState>) -> R<(usize, Vec<String>)> {
-    let db = state.db().await?;
-    let settings = state.settings.read().await.clone();
+async fn import_legacy(state: State<'_, AppState>, game: i64) -> R<(usize, Vec<String>)> {
+    let (db, settings, g, _) = state.game(game).await?;
     let me = settings.name.trim().to_string();
     let legacy = db::legacy(&db).await?.ok_or("This database has no tables from the old Mod.io Mods Manager")?;
-    let ctx = Ctx { http: &state.http, settings: &settings, temp: &state.temp };
+    let ctx = state.ctx(&settings, &g);
     let (mut added, mut failed) = (0, Vec::new());
     let mut found: Vec<R<NewMod>> = Vec::new();
     for (id, name) in &legacy.modio {
@@ -504,7 +733,7 @@ async fn import_legacy(state: State<'_, AppState>) -> R<(usize, Vec<String>)> {
     for m in found {
         match m {
             Ok(m) => {
-                if db::insert_mod(&db, &m, &me).await? {
+                if db::insert_mod(&db, game, &m, &me).await? {
                     added += 1;
                 }
             }
@@ -512,21 +741,21 @@ async fn import_legacy(state: State<'_, AppState>) -> R<(usize, Vec<String>)> {
         }
     }
     if added > 0 {
-        db::record(&db, &me, "import", &format!("{added} mods"), "from the old manager").await?;
+        db::record(&db, game, &me, "import", &format!("{added} mods"), "from the old manager").await?;
     }
     Ok((added, failed))
 }
 
 #[tauri::command]
-async fn open_folder(app: AppHandle, state: State<'_, AppState>, which: String) -> R<()> {
-    let s = state.settings.read().await;
+async fn open_folder(app: AppHandle, state: State<'_, AppState>, game: i64, which: String) -> R<()> {
+    let paths = state.settings.read().await.paths(game);
     let path = match which.as_str() {
-        "mods" => s.mods_dir.clone(),
-        "game" => s.game_dir.clone(),
+        "content" => paths.content_dir,
+        "game" => paths.game_dir,
         _ => return Err("Unknown folder".into()),
     };
     if path.is_empty() {
-        return Err("That folder isn't set yet".into());
+        return Err("That folder isn't set yet (Edit game)".into());
     }
     app.opener().open_path(path, None::<&str>).map_err(|e| e.to_string())
 }
@@ -546,7 +775,7 @@ fn app_version(app: AppHandle) -> String {
 
 // ── live updates ───────────────────────────────────────────────────────────
 
-/// Listens for changes to the list and forwards them to the window as `remote-changed`.
+/// Listens for changes to any list and forwards them to the window as `remote-changed`.
 fn start_listener(app: &AppHandle) {
     let state = app.state::<AppState>();
     let mut slot = state.listener.lock().unwrap();
@@ -587,17 +816,7 @@ pub fn run() {
             std::fs::create_dir_all(&data_dir)?;
             let _ = std::fs::remove_dir_all(&temp);
             std::fs::create_dir_all(&temp)?;
-            let mut settings: Settings = config::load(&data_dir.join("settings.json"));
-            // fill in BONELAB's folders on the first start
-            if settings.mods_dir.is_empty() || settings.game_dir.is_empty() {
-                let found = config::detect();
-                if settings.mods_dir.is_empty() {
-                    settings.mods_dir = found.mods_dir.unwrap_or_default();
-                }
-                if settings.game_dir.is_empty() {
-                    settings.game_dir = found.game_dir.unwrap_or_default();
-                }
-            }
+            let settings: Settings = config::load(&data_dir.join("settings.json"));
             let local: Local = config::load(&data_dir.join("local.json"));
             let http = reqwest::Client::builder()
                 .user_agent(concat!("ModsManager/", env!("CARGO_PKG_VERSION")))
@@ -613,6 +832,7 @@ pub fn run() {
                 sync_lock: Mutex::new(()),
                 listener: std::sync::Mutex::new(None),
                 live: AtomicBool::new(false),
+                local_migrated: AtomicBool::new(false),
             });
             start_listener(app.handle());
             Ok(())
@@ -622,6 +842,15 @@ pub fn run() {
             save_settings,
             detect_folders,
             test_connection,
+            invite_code,
+            read_invite,
+            presets,
+            list_games,
+            create_game,
+            update_game,
+            set_game_paths,
+            delete_game,
+            set_current_game,
             overview,
             resolve_mod,
             search_modio,
@@ -643,69 +872,175 @@ pub fn run() {
         .expect("error while running Mods Manager");
 }
 
-/// Two computers, one shared list, real downloads. Needs a throwaway Postgres:
-/// `MM_TEST_DB=postgres://... cargo test -- --ignored two_friends`
+/// Real database, real downloads. Needs a throwaway Postgres (it drops the mm_* tables):
+/// `MM_TEST_DB=postgres://... cargo test -- --ignored --test-threads=1`
 #[cfg(test)]
 mod e2e {
     use super::*;
 
-    fn computer(name: &str, url: &str) -> AppState {
+    /// One computer: its own folders and state, sharing the database.
+    fn computer(name: &str, url: &str, settings: impl FnOnce(&Path) -> Settings) -> AppState {
         let base = std::env::temp_dir().join(format!("mm-e2e-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
-        for d in ["data", "temp", "mods", "game/Mods", "game/MelonLoader"] {
+        for d in ["data", "temp", "content", "game/Mods", "game/MelonLoader"] {
             std::fs::create_dir_all(base.join(d)).unwrap();
         }
-        let settings = Settings {
-            name: name.into(),
-            database_url: url.into(),
-            mods_dir: base.join("mods").to_string_lossy().into(),
-            game_dir: base.join("game").to_string_lossy().into(),
-            ..Default::default()
-        };
+        let mut s = settings(&base);
+        s.name = name.into();
+        s.database_url = url.into();
         AppState {
             data_dir: base.join("data"),
             temp: base.join("temp"),
-            settings: RwLock::new(settings),
+            settings: RwLock::new(s),
             local: Mutex::new(Local::default()),
             db: Mutex::new(None),
             http: reqwest::Client::builder().user_agent("ModsManager-test").build().unwrap(),
             sync_lock: Mutex::new(()),
             listener: std::sync::Mutex::new(None),
             live: AtomicBool::new(false),
+            local_migrated: AtomicBool::new(false),
         }
     }
 
-    /// What `sync_now` does, minus the window events.
-    async fn sync(state: &AppState) -> Vec<PlanItem> {
+    fn folders(base: &Path) -> GamePaths {
+        GamePaths { content_dir: base.join("content").to_string_lossy().into(), game_dir: base.join("game").to_string_lossy().into() }
+    }
+
+    /// Syncs a game; returns what the plan said to do.
+    async fn sync(state: &AppState, game: i64) -> Vec<&'static str> {
         let db = state.db().await.unwrap();
-        let settings = state.settings.read().await.clone();
-        let mods = db::list_mods(&db).await.unwrap();
-        let items = plan(&settings, &*state.local.lock().await, &mods);
-        for item in &items {
-            let old = state.local.lock().await.installed.get(&item.key).cloned();
-            if item.action == "remove" {
-                install::remove(&settings, &old.unwrap()).unwrap();
-                state.local.lock().await.installed.remove(&item.key);
-            } else {
-                let m = mods.iter().find(|m| Some(m.id) == item.id).unwrap();
-                let p = Progress { index: 0, count: 1, name: m.data.name.clone(), action: item.action, phase: "downloading", done: 0, total: 0 };
-                let inst = install_one(&|_| {}, state, &settings, m, old, p).await.unwrap();
-                state.local.lock().await.installed.insert(item.key.clone(), inst);
-            }
-        }
-        items
+        let paths = state.settings.read().await.paths(game);
+        let mods = db::list_mods(&db, game).await.unwrap();
+        let actions = plan(&paths, &state.local.lock().await.game(game), &mods).iter().map(|p| p.action).collect();
+        let r = run_sync(state, game, &|_| {}).await.unwrap();
+        assert!(r.failed.is_empty(), "{:?}", r.failed);
+        actions
+    }
+
+    async fn raw(url: &str) -> Client {
+        let (c, conn) = tokio_postgres::connect(url, tokio_postgres::NoTls).await.unwrap();
+        tokio::spawn(conn);
+        c
+    }
+
+    async fn reset(url: &str) {
+        raw(url).await.batch_execute("DROP TABLE IF EXISTS mm_mods, mm_events, mm_members, mm_games, mm_presence").await.unwrap();
     }
 
     #[tokio::test]
     #[ignore]
-    async fn two_friends() {
+    async fn migrates_from_v010() {
         let url = std::env::var("MM_TEST_DB").expect("MM_TEST_DB");
-        let ramon = computer("ramon", &url);
-        let cedric = computer("cedric", &url);
-        let db = ramon.db().await.unwrap();
-        db.batch_execute("TRUNCATE mm_mods, mm_events, mm_members").await.unwrap();
+        reset(&url).await;
+        // a database exactly as v0.1.0 left it: no games, one mod, one event
+        raw(&url)
+            .await
+            .batch_execute(
+                "CREATE TABLE mm_mods (id BIGSERIAL PRIMARY KEY, source TEXT NOT NULL, source_id TEXT NOT NULL, target TEXT NOT NULL DEFAULT 'content',
+                   name TEXT NOT NULL, version TEXT NOT NULL DEFAULT '', file_ref TEXT NOT NULL DEFAULT '', file_hash TEXT NOT NULL DEFAULT '',
+                   file_size BIGINT NOT NULL DEFAULT 0, page_url TEXT NOT NULL DEFAULT '', thumb_url TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '',
+                   author TEXT NOT NULL DEFAULT '', extra JSONB NOT NULL DEFAULT '{}', added_by TEXT NOT NULL, added_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                   updated_by TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE (source, source_id));
+                 CREATE TABLE mm_events (id BIGSERIAL PRIMARY KEY, at TIMESTAMPTZ NOT NULL DEFAULT now(), actor TEXT NOT NULL, action TEXT NOT NULL,
+                   mod_name TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '');
+                 CREATE TABLE mm_members (name TEXT PRIMARY KEY, last_seen TIMESTAMPTZ NOT NULL DEFAULT now(), pending INT NOT NULL DEFAULT 0, synced_at TIMESTAMPTZ);
+                 INSERT INTO mm_mods (source, source_id, target, name, version, file_ref, added_by, updated_by)
+                   VALUES ('thunderstore', 'Lakatrazz/Fusion', 'code', 'Fusion', '1.14.3', '1.14.3', 'ramon', 'ramon');
+                 INSERT INTO mm_events (actor, action, mod_name, detail) VALUES ('ramon', 'add', 'Fusion', '1.14.3');
+                 INSERT INTO mm_members (name) VALUES ('cedric');",
+            )
+            .await
+            .unwrap();
 
-        // cedric's app listens for changes
+        // ramon's v0.1.0 files, exactly as that version wrote them
+        let ramon = computer("ramon-old", &url, |_| Settings::default());
+        let base = ramon.data_dir.parent().unwrap().to_path_buf();
+        let old = folders(&base);
+        std::fs::write(
+            ramon.data_dir.join("settings.json"),
+            serde_json::json!({ "name": "ramon", "databaseUrl": url, "modioApiKey": "", "modioToken": "", "gameId": 3809,
+                                "modsDir": old.content_dir, "gameDir": old.game_dir, "autoSync": false })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            ramon.data_dir.join("local.json"),
+            serde_json::json!({
+                "installed": { "thunderstore:Lakatrazz/Fusion": { "name": "Fusion", "pin": "1.14.3|", "version": "1.14.3", "root": "game",
+                                                                  "paths": ["Mods/LabFusion.dll"], "installed_at": "2026-11-07T18:00:00Z" } },
+                "ignored": ["mods/Old.Pallet"]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(base.join("game/Mods/LabFusion.dll"), b"x").unwrap();
+        // what the new version loads on start
+        *ramon.settings.write().await = config::load(&ramon.data_dir.join("settings.json"));
+        *ramon.local.lock().await = config::load(&ramon.data_dir.join("local.json"));
+
+        let db = ramon.db().await.unwrap();
+        let games = db::games(&db).await.unwrap();
+        assert_eq!(games.len(), 1, "one BONELAB game");
+        let bonelab = games[0].id;
+        assert_eq!((games[0].data.name.as_str(), games[0].data.modio_id, games[0].data.loader.as_str()), ("BONELAB", db::BONELAB_MODIO, "melonloader"));
+        assert_eq!(db::list_mods(&db, bonelab).await.unwrap().len(), 1, "the old mod moved into BONELAB");
+        assert_eq!(db::events(&db, bonelab, 10).await.unwrap().len(), 1, "and its activity");
+        assert!(db::members(&db, bonelab).await.unwrap().iter().any(|m| m.name == "cedric"), "and its people");
+
+        let s = ramon.settings.read().await.clone();
+        assert_eq!(s.current_game, Some(bonelab));
+        assert!(s.mods_dir.is_empty() && s.game_dir.is_empty());
+        assert_eq!(s.paths(bonelab), old);
+        let local = ramon.local.lock().await.game(bonelab);
+        assert!(local.installed.contains_key("thunderstore:Lakatrazz/Fusion"));
+        assert!(local.ignored.contains("content/Old.Pallet"));
+        // written to disk, so the next start doesn't migrate again
+        let on_disk: Settings = config::load(&ramon.data_dir.join("settings.json"));
+        assert_eq!(on_disk.current_game, Some(bonelab));
+        let on_disk: Local = config::load(&ramon.data_dir.join("local.json"));
+        assert!(on_disk.installed.is_empty() && on_disk.games.contains_key(&bonelab));
+
+        // Fusion was installed with the same pin: nothing downloads again
+        assert!(plan(&s.paths(bonelab), &local, &db::list_mods(&db, bonelab).await.unwrap()).is_empty());
+
+        // an old app that's still running adds a mod without a game: the next connect adopts it
+        raw(&url)
+            .await
+            .batch_execute("INSERT INTO mm_mods (source, source_id, name, added_by, updated_by) VALUES ('modio', '1', 'Late', 'cedric', 'cedric')")
+            .await
+            .unwrap();
+        db::connect(&url).await.unwrap();
+        assert_eq!(db::list_mods(&db, bonelab).await.unwrap().len(), 2);
+        assert_eq!(db::games(&db).await.unwrap().len(), 1, "no second BONELAB");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn three_friends_two_games() {
+        let url = std::env::var("MM_TEST_DB").expect("MM_TEST_DB");
+        reset(&url).await;
+        let setup = computer("setup", &url, |_| Settings::default());
+        let db = setup.db().await.unwrap();
+        let presets = db::presets();
+        let bonelab = db::insert_game(&db, &presets[0], "ramon").await.unwrap();
+        let lethal = db::insert_game(&db, &presets[2], "ramon").await.unwrap();
+
+        let make = |name: &str| {
+            computer(name, &url, |base| Settings {
+                games: [(bonelab, folders(&base.join("bonelab"))), (lethal, folders(&base.join("lethal")))].into(),
+                ..Default::default()
+            })
+        };
+        let (ramon, cedric, alex) = (make("ramon"), make("cedric"), make("alex"));
+        for c in [&ramon, &cedric, &alex] {
+            let s = c.settings.read().await.clone();
+            for p in s.games.values() {
+                std::fs::create_dir_all(&p.content_dir).unwrap();
+                std::fs::create_dir_all(Path::new(&p.game_dir).join("MelonLoader")).unwrap();
+            }
+        }
+
+        // everyone hears changes live
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let listen_url = url.clone();
         tokio::spawn(async move {
@@ -716,9 +1051,10 @@ mod e2e {
         });
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        // ramon adds Fusion, pinned to an older version
+        // ramon: Fusion (MelonLoader) on BONELAB, pinned to an older version
         let rs = ramon.settings.read().await.clone();
-        let ctx = Ctx { http: &ramon.http, settings: &rs, temp: &ramon.temp };
+        let bg = db::game(&db, bonelab).await.unwrap();
+        let ctx = ramon.ctx(&rs, &bg);
         let (latest, _) = sources::thunderstore::pinned(&ctx, "Lakatrazz", "Fusion", None).await.unwrap();
         let mut older = None;
         for v in ["1.14.2", "1.14.1", "1.14.0", "1.13.0", "1.12.0"] {
@@ -728,51 +1064,72 @@ mod e2e {
             }
         }
         let older = older.expect("an older Fusion version");
-        assert_ne!(older.version, latest.version);
-        assert!(db::insert_mod(&db, &older, "ramon").await.unwrap());
-        db::record(&db, "ramon", "add", &older.name, &older.version).await.unwrap();
+        assert_eq!(older.target, "code");
+        assert!(db::insert_mod(&db, bonelab, &older, "ramon").await.unwrap());
+        db::record(&db, bonelab, "ramon", "add", &older.name, &older.version).await.unwrap();
+        let heard = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.expect("heard live").unwrap();
+        assert!(heard.contains(&format!("\"game\":{bonelab}")) && heard.contains("\"add\""), "{heard}");
 
-        let heard = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.expect("cedric hears it live").unwrap();
-        assert!(heard.contains("\"actor\":\"ramon\"") && heard.contains("\"add\""), "{heard}");
-
-        // cedric syncs: Fusion gets installed, MelonLoader layout
-        let done = sync(&cedric).await;
-        assert_eq!(done.len(), 1);
-        assert_eq!(done[0].action, "install");
-        let inst = cedric.local.lock().await.installed.values().next().cloned().unwrap();
-        assert_eq!(inst.version, older.version);
-        assert!(inst.paths.iter().any(|p| p.starts_with("Mods/") && p.ends_with(".dll")), "{:?}", inst.paths);
+        // cedric: a BepInEx mod on Lethal Company; BepInExPack comes along as a dependency
+        let lg = db::game(&db, lethal).await.unwrap();
         let cs = cedric.settings.read().await.clone();
-        assert!(install::is_present(&cs, &inst));
-        assert!(sync(&cedric).await.is_empty(), "nothing left after a sync");
-
-        // ramon updates it for both of them
-        let id = db::list_mods(&db).await.unwrap()[0].id;
-        let cur = db::get_mod(&db, id).await.unwrap();
-        let next = sources::latest(&ctx, &cur.data, true).await.unwrap().expect("a newer version");
-        db::repin(&db, id, &next, "ramon").await.unwrap();
-        let done = sync(&cedric).await;
-        assert_eq!(done.len(), 1);
-        assert_eq!(done[0].action, "update");
-        assert_eq!(cedric.local.lock().await.installed.values().next().unwrap().version, latest.version);
-
-        // a DLL nobody put on the list shows up as unmanaged
-        std::fs::write(std::path::Path::new(&cs.game_dir).join("Mods/Stray.dll"), b"x").unwrap();
-        let stray = install::unmanaged(&cs, &*cedric.local.lock().await);
-        assert_eq!(stray.iter().map(|u| u.key.as_str()).collect::<Vec<_>>(), vec!["game/Mods/Stray.dll"]);
-
-        // ramon removes it; cedric's files go on the next sync
-        let paths = cedric.local.lock().await.installed.values().next().unwrap().paths.clone();
-        db::delete_mod(&db, id).await.unwrap();
-        let done = sync(&cedric).await;
-        assert_eq!(done[0].action, "remove");
-        for p in paths {
-            assert!(!std::path::Path::new(&cs.game_dir).join(p).exists());
+        let lctx = cedric.ctx(&cs, &lg);
+        let resolved = sources::resolve(&lctx, "https://thunderstore.io/c/lethal-company/p/notnotnotswipez/MoreCompany/", &AddOptions { name: String::new(), target: "content".into() })
+            .await
+            .unwrap();
+        let dep_ids: Vec<&String> = resolved.deps.iter().map(|d| &d.source_id).collect();
+        assert!(dep_ids.iter().any(|d| d.to_lowercase().contains("bepinexpack")), "{dep_ids:?}");
+        for m in std::iter::once(&resolved.main).chain(resolved.deps.iter()) {
+            db::insert_mod(&db, lethal, m, "cedric").await.unwrap();
         }
-        assert!(cedric.local.lock().await.installed.is_empty());
 
-        db::heartbeat(&db, "cedric", 0, true).await.unwrap();
-        let members = db::members(&db).await.unwrap();
-        assert!(members.iter().any(|m| m.name == "cedric" && m.pending == 0 && m.synced_at.is_some()));
+        // all three sync both games
+        for c in [&ramon, &cedric, &alex] {
+            assert_eq!(sync(c, bonelab).await, vec!["install"]);
+            let actions = sync(c, lethal).await;
+            assert!(actions.len() >= 2 && actions.iter().all(|a| *a == "install"), "{actions:?}");
+            assert!(sync(c, bonelab).await.is_empty() && sync(c, lethal).await.is_empty());
+        }
+        let alex_paths = alex.settings.read().await.paths(lethal);
+        assert!(install::loader_installed(&alex_paths, "bepinex"), "BepInExPack landed in the game folder");
+        let alex_local = alex.local.lock().await.game(lethal);
+        let more = alex_local.installed.get(&resolved.main.key()).unwrap();
+        assert!(more.paths.iter().all(|p| p.starts_with("BepInEx/")), "{:?}", more.paths);
+        assert!(install::unmanaged(&alex_paths, "bepinex", &alex_local).is_empty(), "everything installed is accounted for");
+
+        // ramon updates Fusion: the other two get the update, Lethal Company stays untouched
+        let id = db::list_mods(&db, bonelab).await.unwrap()[0].id;
+        let cur = db::get_mod(&db, id).await.unwrap();
+        let next = sources::latest(&ctx, &cur.data, true).await.unwrap().expect("newer Fusion");
+        db::repin(&db, id, &next, "ramon").await.unwrap();
+        for c in [&cedric, &alex] {
+            assert_eq!(sync(c, bonelab).await, vec!["update"]);
+            assert!(sync(c, lethal).await.is_empty());
+            assert_eq!(c.local.lock().await.game(bonelab).installed.values().next().unwrap().version, latest.version);
+        }
+
+        // presence: three people, each with their own state in BONELAB
+        for (who, pending) in [("ramon", 1), ("cedric", 0), ("alex", 0)] {
+            db::heartbeat(&db, who, bonelab, pending, pending == 0).await.unwrap();
+        }
+        let members = db::members(&db, bonelab).await.unwrap();
+        assert_eq!(members.len(), 3);
+        assert_eq!(members.iter().find(|m| m.name == "ramon").unwrap().pending, Some(1));
+
+        // removing a game clears its list for everyone
+        db::delete_game(&db, lethal).await.unwrap();
+        assert!(db::list_mods(&db, lethal).await.unwrap().is_empty());
+        assert_eq!(db::games(&db).await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn invite_codes_round_trip() {
+        let code = format!(
+            "{INVITE_PREFIX}{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&Invite { database_url: "postgres://a:b@c/d".into(), game: Some(3) }).unwrap())
+        );
+        let back = read_invite(code).unwrap();
+        assert_eq!((back.database_url.as_str(), back.game), ("postgres://a:b@c/d", Some(3)));
+        assert!(read_invite("nope".into()).is_err());
     }
 }

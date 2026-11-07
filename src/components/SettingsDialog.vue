@@ -1,31 +1,28 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref, type Component } from "vue";
-import { Check, CircleCheck, Database, FolderOpen, KeyRound, Loader2, Paintbrush, RefreshCw, ScanSearch, User, Wrench, X, Zap } from "lucide-vue-next";
-import { open } from "@tauri-apps/plugin-dialog";
+import { Check, CircleCheck, Database, FolderCog, FolderOpen, Gamepad2, KeyRound, Loader2, Paintbrush, Pencil, Plus, RefreshCw, User, UserPlus, Wrench, X, Zap } from "lucide-vue-next";
 import markUrl from "@/assets/mark.svg";
-import { api, type Settings } from "@/lib/api";
-import { saveSettings, settingsDialog, type SettingsSection } from "@/lib/settingsDialog";
-import { currentDesign, setDesign, type Design } from "@/lib/design";
-import { refresh, store } from "@/lib/store";
-import { errorText, toast } from "@/lib/toast";
+import SecretInput from "./SecretInput.vue";
 import UnmanagedDialog from "./UnmanagedDialog.vue";
+import InviteDialog from "./InviteDialog.vue";
+import { api, DB_PLACEHOLDER, LOADER_LABEL, type Settings } from "@/lib/api";
+import { saveSettings, settingsDialog, type SettingsSection } from "@/lib/settingsDialog";
+import { gameDialog } from "@/lib/dialogs";
+import { currentDesign, setDesign, type Design } from "@/lib/design";
+import { currentGame, hasPaths, refresh, store } from "@/lib/store";
+import { errorText, toast } from "@/lib/toast";
 
 const groups: { title: string; items: { id: SettingsSection; label: string; icon: Component }[] }[] = [
   { title: "You", items: [{ id: "profile", label: "Profile", icon: User }] },
   {
     title: "Sharing",
     items: [
-      { id: "shared", label: "Shared list", icon: Database },
+      { id: "shared", label: "Shared database", icon: Database },
+      { id: "games", label: "Games", icon: Gamepad2 },
       { id: "sync", label: "Syncing", icon: Zap },
     ],
   },
-  {
-    title: "BONELAB",
-    items: [
-      { id: "modio", label: "mod.io", icon: KeyRound },
-      { id: "folders", label: "Folders", icon: FolderOpen },
-    ],
-  },
+  { title: "Sources", items: [{ id: "modio", label: "mod.io", icon: KeyRound }] },
   {
     title: "App",
     items: [
@@ -35,7 +32,7 @@ const groups: { title: string; items: { id: SettingsSection; label: string; icon
   },
 ];
 
-/** A local copy: text fields save when you leave them. */
+/** A local copy: fields save when you leave them. */
 const s = ref<Settings>({ ...store.settings! });
 const version = ref("");
 const design = ref<Design>(currentDesign());
@@ -43,10 +40,12 @@ const testing = ref(false);
 const tested = ref<"" | "ok" | string>("");
 const importing = ref(false);
 const reviewing = ref(false);
+const inviting = ref(false);
+const game = () => store.games?.find((g) => g.id === currentGame()) ?? null;
 
 const close = () => (settingsDialog.open = false);
 function onKey(e: KeyboardEvent) {
-  if (e.key === "Escape" && !reviewing.value) close();
+  if (e.key === "Escape" && !reviewing.value && !inviting.value) close();
 }
 onMounted(async () => {
   window.addEventListener("keydown", onKey);
@@ -79,33 +78,26 @@ async function test() {
   }
 }
 
-async function browse(key: "modsDir" | "gameDir") {
-  const dir = await open({ directory: true, defaultPath: s.value[key] || undefined });
-  if (typeof dir === "string") {
-    s.value[key] = dir;
-    commit(key);
-  }
-}
-
-async function detect() {
-  const found = await api.detectFolders();
-  const patch: Partial<Settings> = {};
-  if (found.modsDir) patch.modsDir = s.value.modsDir = found.modsDir;
-  if (found.gameDir) patch.gameDir = s.value.gameDir = found.gameDir;
-  if (!found.modsDir && !found.gameDir) return toast.info("Couldn't find BONELAB on this computer");
-  await save(patch);
-  toast.success("Found BONELAB's folders");
-}
-
 function pickDesign(d: Design) {
   design.value = d;
   setDesign(d);
 }
 
+/** Dialogs from the top level, over Settings. */
+function openGame(kind: "add" | "edit" | "paths", id?: number) {
+  const g = store.games?.find((x) => x.id === id) ?? null;
+  close();
+  if (kind === "add") gameDialog.add = true;
+  else if (kind === "edit") gameDialog.edit = g;
+  else gameDialog.paths = g;
+}
+
 async function importLegacy() {
+  const id = currentGame();
+  if (id == null) return;
   importing.value = true;
   try {
-    const [n, failed] = await api.importLegacy();
+    const [n, failed] = await api.importLegacy(id);
     if (failed.length) toast.error(`Imported ${n}; ${failed.length} failed: ${failed.join("; ")}`);
     else toast.success(n ? `Imported ${n} mods from the old manager` : "Everything from the old manager is already on the list");
     await refresh();
@@ -114,6 +106,11 @@ async function importLegacy() {
   } finally {
     importing.value = false;
   }
+}
+
+function openFolder(which: "content" | "game") {
+  const id = currentGame();
+  if (id != null) api.openFolder(id, which).catch((e) => toast.error(errorText(e)));
 }
 </script>
 
@@ -152,7 +149,7 @@ async function importLegacy() {
             <template v-if="settingsDialog.section === 'profile'">
               <div class="set-block">
                 <h3 class="set-title">Your name</h3>
-                <p class="set-hint">Your friend sees it next to everything you add, update or remove.</p>
+                <p class="set-hint">Everyone sees it next to what you add, update or remove.</p>
                 <input v-model="s.name" class="input" @blur="commit('name')" @keydown.enter="commit('name')" />
               </div>
             </template>
@@ -160,9 +157,9 @@ async function importLegacy() {
             <template v-else-if="settingsDialog.section === 'shared'">
               <div class="set-block">
                 <h3 class="set-title">Shared database</h3>
-                <p class="set-hint">The Postgres database that holds the list. Both of you use the same address. Mods Manager creates its own tables (mm_mods, mm_events, mm_members).</p>
+                <p class="set-hint">The Postgres database that holds every game's list. Everyone uses the same address. Mods Manager creates its own tables (mm_…).</p>
                 <div class="row" style="gap: 8px">
-                  <input v-model="s.databaseUrl" class="input mono" placeholder="postgres://user:password@host:5432/mods" @blur="commit('databaseUrl')" @input="tested = ''" />
+                  <SecretInput v-model="s.databaseUrl" :placeholder="DB_PLACEHOLDER" style="flex: 1" @done="commit('databaseUrl')" @update:model-value="tested = ''" />
                   <button class="btn" :disabled="testing || !s.databaseUrl.trim()" @click="test">
                     <Loader2 v-if="testing" class="spin" /><CircleCheck v-else-if="tested === 'ok'" style="color: var(--status-green)" /> Test
                   </button>
@@ -172,6 +169,33 @@ async function importLegacy() {
                   <span class="live" :class="{ on: store.live }"><span class="run-dot" />{{ store.live ? "Live updates connected" : "Live updates not connected" }}</span>
                 </p>
               </div>
+              <div class="set-block">
+                <h3 class="set-title">Invite people</h3>
+                <p class="set-hint">An invite code sets up someone's app in one paste: the database and the game you're on. Anyone with it can join.</p>
+                <button class="btn" style="align-self: flex-start" @click="inviting = true"><UserPlus /> Invite someone</button>
+              </div>
+            </template>
+
+            <template v-else-if="settingsDialog.section === 'games'">
+              <div class="set-block">
+                <h3 class="set-title">Games</h3>
+                <p class="set-hint">Each game has its own shared list. Folders are per computer.</p>
+                <div v-if="store.games?.length" class="set-table">
+                  <div v-for="g in store.games" :key="g.id" class="set-row">
+                    <Gamepad2 :size="18" class="muted" />
+                    <div class="stack" style="gap: 2px; flex: 1; min-width: 0">
+                      <strong class="ellipsis">{{ g.name }}</strong>
+                      <span class="hint ellipsis">
+                        {{ g.mods }} mods · {{ LOADER_LABEL[g.loader] }}
+                        <span v-if="!hasPaths(g.id)" style="color: var(--status-orange)"> · folders not set here</span>
+                      </span>
+                    </div>
+                    <button class="btn btn-sm" title="Folders on this computer" @click="openGame('paths', g.id)"><FolderCog /> Folders</button>
+                    <button class="btn btn-sm btn-icon" :title="`Edit ${g.name}`" :aria-label="`Edit ${g.name}`" @click="openGame('edit', g.id)"><Pencil /></button>
+                  </div>
+                </div>
+                <button class="btn" style="align-self: flex-start" @click="openGame('add')"><Plus /> Add a game</button>
+              </div>
             </template>
 
             <template v-else-if="settingsDialog.section === 'sync'">
@@ -180,7 +204,7 @@ async function importLegacy() {
                   <label class="set-row">
                     <div class="stack" style="gap: 2px; flex: 1">
                       <strong>Sync on its own</strong>
-                      <span class="hint">When your friend adds, updates or removes a mod while the app is open, install the change right away.</span>
+                      <span class="hint">When someone adds, updates or removes a mod in the game you're on, install the change right away.</span>
                     </div>
                     <span class="switch"><input v-model="s.autoSync" type="checkbox" @change="commit('autoSync')" /><span /></span>
                   </label>
@@ -191,43 +215,14 @@ async function importLegacy() {
             <template v-else-if="settingsDialog.section === 'modio'">
               <div class="set-block">
                 <h3 class="set-title">API key</h3>
-                <p class="set-hint">For searching and reading mods. Get one on mod.io under Account → API access.</p>
-                <input v-model="s.modioApiKey" class="input mono" @blur="commit('modioApiKey')" />
+                <p class="set-hint">For searching and reading mods on mod.io, for every game. Get one on mod.io under Account → API access.</p>
+                <SecretInput v-model="s.modioApiKey" @done="commit('modioApiKey')" />
               </div>
               <div class="set-block">
                 <h3 class="set-title">OAuth token <span class="hint">(optional)</span></h3>
                 <p class="set-hint">Only needed if downloads fail with "unauthorized": some files need a signed-in mod.io user. Create one under API access → OAuth 2 tokens.</p>
-                <input v-model="s.modioToken" class="input mono" type="password" @blur="commit('modioToken')" />
+                <SecretInput v-model="s.modioToken" @done="commit('modioToken')" />
               </div>
-              <div class="set-block">
-                <h3 class="set-title">Game id</h3>
-                <p class="set-hint">BONELAB is 3809.</p>
-                <input v-model.number="s.gameId" class="input num" type="number" style="width: 140px" @blur="commit('gameId')" />
-              </div>
-            </template>
-
-            <template v-else-if="settingsDialog.section === 'folders'">
-              <div class="set-block">
-                <h3 class="set-title">BONELAB Mods folder</h3>
-                <p class="set-hint">Where content mods (pallets) go.</p>
-                <div class="row" style="gap: 8px">
-                  <input v-model="s.modsDir" class="input mono" @blur="commit('modsDir')" />
-                  <button class="btn btn-icon" title="Browse" aria-label="Browse" @click="browse('modsDir')"><FolderOpen /></button>
-                </div>
-              </div>
-              <div class="set-block">
-                <h3 class="set-title">BONELAB game folder</h3>
-                <p class="set-hint">Where MelonLoader and code mods live (it has Mods, Plugins, UserLibs and UserData).</p>
-                <div class="row" style="gap: 8px">
-                  <input v-model="s.gameDir" class="input mono" @blur="commit('gameDir')" />
-                  <button class="btn btn-icon" title="Browse" aria-label="Browse" @click="browse('gameDir')"><FolderOpen /></button>
-                </div>
-                <p class="set-hint">
-                  MelonLoader:
-                  <strong :style="{ color: store.overview?.melon ? 'var(--status-green)' : 'var(--status-orange)' }">{{ store.overview?.melon ? "installed" : "not found" }}</strong>
-                </p>
-              </div>
-              <button class="btn" style="align-self: flex-start" @click="detect"><ScanSearch /> Find BONELAB automatically</button>
             </template>
 
             <template v-else-if="settingsDialog.section === 'appearance'">
@@ -269,32 +264,36 @@ async function importLegacy() {
             </template>
 
             <template v-else-if="settingsDialog.section === 'maintenance'">
-              <div class="set-block">
-                <h3 class="set-title">Files not on the list</h3>
-                <p class="set-hint">Mods in your folders that the list doesn't know about. Your friend doesn't have them.</p>
-                <button class="btn" style="align-self: flex-start" @click="reviewing = true">Review ({{ store.overview?.unmanaged ?? 0 }})</button>
-              </div>
-              <div class="set-block">
-                <h3 class="set-title">Import from the old manager</h3>
-                <p class="set-hint">
-                  Copies the mods and code mods from the old Mod.io-Mods-Manager tables in this database onto the list, pinned to today's files. Run it once.
-                </p>
-                <button class="btn" style="align-self: flex-start" :disabled="importing" @click="importLegacy">
-                  <Loader2 v-if="importing" class="spin" /><RefreshCw v-else /> Import
-                </button>
-              </div>
-              <div class="set-block">
-                <h3 class="set-title">Folders</h3>
-                <div class="row" style="gap: 8px">
-                  <button class="btn" @click="api.openFolder('mods').catch((e) => toast.error(errorText(e)))"><FolderOpen /> Mods folder</button>
-                  <button class="btn" @click="api.openFolder('game').catch((e) => toast.error(errorText(e)))"><FolderOpen /> Game folder</button>
+              <template v-if="game()">
+                <div class="set-block">
+                  <h3 class="set-title">Files not on {{ game()!.name }}'s list</h3>
+                  <p class="set-hint">Mods in its folders that the list doesn't know about. The others don't have them.</p>
+                  <button class="btn" style="align-self: flex-start" @click="reviewing = true">Review ({{ store.overview?.unmanaged ?? 0 }})</button>
                 </div>
-              </div>
+                <div class="set-block">
+                  <h3 class="set-title">Folders</h3>
+                  <div class="row" style="gap: 8px">
+                    <button class="btn" @click="openFolder('content')"><FolderOpen /> Mods folder</button>
+                    <button class="btn" @click="openFolder('game')"><FolderOpen /> Game folder</button>
+                  </div>
+                </div>
+                <div class="set-block">
+                  <h3 class="set-title">Import from the old manager</h3>
+                  <p class="set-hint">
+                    Copies the mods from the old Mod.io-Mods-Manager tables in this database onto {{ game()!.name }}'s list, pinned to today's files. Run it once.
+                  </p>
+                  <button class="btn" style="align-self: flex-start" :disabled="importing" @click="importLegacy">
+                    <Loader2 v-if="importing" class="spin" /><RefreshCw v-else /> Import into {{ game()!.name }}
+                  </button>
+                </div>
+              </template>
+              <p v-else class="set-hint">Add a game first.</p>
             </template>
           </section>
         </div>
       </div>
     </div>
-    <UnmanagedDialog v-if="reviewing" @close="(reviewing = false), refresh()" />
+    <UnmanagedDialog v-if="reviewing && game()" :game="game()!.id" @close="(reviewing = false), refresh()" />
+    <InviteDialog v-if="inviting" @close="inviting = false" />
   </Teleport>
 </template>

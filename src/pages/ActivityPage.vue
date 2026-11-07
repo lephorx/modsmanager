@@ -5,13 +5,16 @@ import { ArrowUpCircle, History, Import, Loader2, Minus, Plus } from "lucide-vue
 import { api, type ModEvent } from "@/lib/api";
 import { ago } from "@/lib/format";
 import { errorText } from "@/lib/toast";
+import { currentGame, store } from "@/lib/store";
 
 const events = ref<ModEvent[] | null>(null);
 const error = ref("");
 
 async function load() {
+  const game = currentGame();
+  if (game == null) return void (events.value = []);
   try {
-    events.value = await api.events();
+    events.value = await api.events(game);
     error.value = "";
   } catch (e) {
     error.value = errorText(e);
@@ -54,7 +57,7 @@ const days = computed(() => {
     <div class="page-header">
       <div>
         <h1 class="page-title">Activity</h1>
-        <p class="page-sub">Who changed the list, and when</p>
+        <p class="page-sub">Who changed {{ store.overview?.game.name ?? "the list" }}, and when</p>
       </div>
     </div>
     <p v-if="error" class="error-text selectable">{{ error }}</p>
