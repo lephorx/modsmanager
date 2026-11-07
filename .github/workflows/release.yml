@@ -23,7 +23,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --draft --verify-tag --title "Mods Manager $GITHUB_REF_NAME" --notes-from-tag
-          echo "id=$(gh api "repos/$GITHUB_REPOSITORY/releases" --jq ".[] | select(.tag_name == \"$GITHUB_REF_NAME\") | .id" | head -1)" >> "$GITHUB_OUTPUT"
+          id=$(gh release view "$GITHUB_REF_NAME" --json databaseId --jq .databaseId)
+          # without the id the build would skip every upload and publish an empty release
+          [ -n "$id" ] || { echo "Couldn't find the draft release for $GITHUB_REF_NAME"; exit 1; }
+          echo "id=$id" >> "$GITHUB_OUTPUT"
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
@@ -53,7 +56,10 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release edit "$GITHUB_REF_NAME" --draft=false --latest
+        run: |
+          n=$(gh release view "$GITHUB_REF_NAME" --json assets --jq '[.assets[].name | select(endswith("latest.json") or endswith("-setup.exe") or endswith(".sig"))] | length')
+          [ "$n" -ge 3 ] || { echo "Only $n of the installer, signature and latest.json are uploaded; not publishing"; exit 1; }
+          gh release edit "$GITHUB_REF_NAME" --draft=false --latest
       # the updater file must point at the published files (not a draft's temporary links)
       - name: Check the update file
         if: github.ref_type == 'tag'
