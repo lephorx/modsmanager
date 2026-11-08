@@ -82,7 +82,7 @@ pub async fn download(fetch: Fetch, dest: &Path, mut progress: impl FnMut(u64, u
     let sha256 = hex::encode(sha.finalize());
     if let Some(want) = fetch.md5 {
         if !want.eq_ignore_ascii_case(&md5) {
-            return Err("The download doesn't match the pinned file (MD5 differs). Try again.".into());
+            return Err(format!("The server sent a different file than the one pinned on the list ({} downloaded, checksum differs). If a retry fails too, the file changed on the mod's page; pin another version.", human_size(done)));
         }
     }
     if let Some(want) = fetch.sha256 {
@@ -403,6 +403,10 @@ pub fn remove(paths: &GamePaths, inst: &Installed) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn human_size(n: u64) -> String {
+    if n >= 1 << 20 { format!("{:.0} MB", n as f64 / (1u64 << 20) as f64) } else { format!("{} KB", n.div_ceil(1024)) }
 }
 
 #[derive(Serialize, Clone)]
