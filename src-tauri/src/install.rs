@@ -392,6 +392,10 @@ pub fn remove(paths: &GamePaths, inst: &Installed) -> Result<(), String> {
     for rel in &inst.paths {
         let Some(path) = safe_join(&root, rel) else { continue };
         remove_any(&path).map_err(|e| format!("Can't delete {}: {e}", path.display()))?;
+        if inst.root == Root::Content {
+            // BONELAB writes `<pallet folder>.manifest` next to each mod it loads; it goes too
+            let _ = std::fs::remove_file(root.join(format!("{rel}.manifest")));
+        }
         if inst.root == Root::Game {
             let mut dir = path.parent().map(Path::to_path_buf);
             while let Some(d) = dir {
@@ -436,7 +440,9 @@ pub fn unmanaged(paths: &GamePaths, loader: &str, local: &LocalGame) -> Vec<Unma
             for e in items {
                 let name = e.file_name().to_string_lossy().into_owned();
                 let key = format!("content/{name}");
-                if name.starts_with('.') || owned.contains(&name.to_ascii_lowercase()) || local.ignored.contains(&key) {
+                // `<folder>.manifest`: BONELAB's own bookkeeping for a mod folder it loaded, not a mod
+                let game_file = name.to_ascii_lowercase().ends_with(".manifest") && e.path().is_file();
+                if name.starts_with('.') || game_file || owned.contains(&name.to_ascii_lowercase()) || local.ignored.contains(&key) {
                     continue;
                 }
                 out.push(Unmanaged { key, name, path: e.path().to_string_lossy().into_owned(), is_dir: e.path().is_dir() });
@@ -627,5 +633,21 @@ mod tests {
         assert!(!is_present(&paths, &inst));
         write(&mods, "Old.Mod/a.bundle");
         assert!(is_present(&paths, &inst));
+    }
+
+    #[test]
+    fn game_manifests_are_not_unmanaged_and_go_with_their_mod() {
+        let mods = tmp("manifests");
+        write(&mods, "BaBaCorp.711/pallet.json");
+        write(&mods, "BaBaCorp.711.manifest");
+        write(&mods, "Someone.Else/pallet.json");
+        let paths = GamePaths { content_dir: mods.to_string_lossy().into(), ..Default::default() };
+        let mut local = LocalGame::default();
+        let inst = installed(Root::Content, vec!["BaBaCorp.711".into()]);
+        local.installed.insert("modio:1".into(), inst.clone());
+        let names: Vec<String> = unmanaged(&paths, "none", &local).into_iter().map(|u| u.name).collect();
+        assert_eq!(names, vec!["Someone.Else"]);
+        remove(&paths, &inst).unwrap();
+        assert!(!mods.join("BaBaCorp.711.manifest").exists());
     }
 }
