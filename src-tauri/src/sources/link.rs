@@ -14,9 +14,9 @@ fn file_name_of(link: &str) -> String {
 
 /// Downloads the file once to pin its hash.
 async fn pin(ctx: &Ctx<'_>, link: &str) -> Result<install::Downloaded, String> {
-    let fetch = Fetch { request: ctx.http.get(link), file_name: file_name_of(link), md5: None, sha256: None };
+    let fetch = Fetch { request: ctx.http.get(link), file_name: file_name_of(link) };
     let dest = ctx.temp.join(format!("pin-{}-{}", std::process::id(), chrono::Utc::now().timestamp_millis()));
-    let got = install::download(fetch, &dest, |_, _| {}, || false).await;
+    let got = install::download(&fetch, &dest, |_, _| {}, || false).await;
     let _ = tokio::fs::remove_file(&dest).await;
     got
 }
@@ -57,7 +57,5 @@ pub fn fetch(ctx: &Ctx<'_>, cur: &NewMod) -> Fetch {
     Fetch {
         request: ctx.http.get(&cur.source_id),
         file_name: file_name_of(&cur.source_id),
-        md5: None,
-        sha256: Some(cur.file_hash.clone()).filter(|h| !h.is_empty()),
     }
 }

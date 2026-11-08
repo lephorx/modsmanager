@@ -6,6 +6,8 @@ use super::{check, s, Ctx, Fetch, SearchHit};
 use crate::db::NewMod;
 
 const API: &str = "https://api.mod.io/v1";
+/// Mods Manager installs into the Windows game: always ask mod.io for the PC files.
+const PLATFORM: &str = "windows";
 
 fn get(ctx: &Ctx<'_>, path: &str) -> Result<reqwest::RequestBuilder, String> {
     let st = ctx.settings;
@@ -13,7 +15,9 @@ fn get(ctx: &Ctx<'_>, path: &str) -> Result<reqwest::RequestBuilder, String> {
     if game <= 0 {
         return Err(format!("{} isn't set up for mod.io (Edit game → mod.io)", ctx.game.data.name));
     }
-    let req = ctx.http.get(format!("{API}/games/{game}{path}"));
+    // Mods with separate PC and Quest files only report their live PC file with the platform
+    // named; without it mod.io answers with no live file (and update checks see nothing).
+    let req = ctx.http.get(format!("{API}/games/{game}{path}")).header("X-Modio-Platform", PLATFORM);
     auth(st, req)
 }
 
@@ -107,13 +111,12 @@ pub async fn fetch(ctx: &Ctx<'_>, cur: &NewMod) -> Result<Fetch, String> {
     if url.is_empty() {
         return Err("mod.io didn't give a download link for this file".into());
     }
-    let mut request = ctx.http.get(url);
+    let mut request = ctx.http.get(url).header("X-Modio-Platform", PLATFORM);
     let token = ctx.settings.modio_token.trim();
     if !token.is_empty() {
         request = request.bearer_auth(token);
     }
-    let md5 = Some(s(&f["filehash"]["md5"])).filter(|h| !h.is_empty());
-    Ok(Fetch { request, file_name: s(&f["filename"]), md5, sha256: None })
+    Ok(Fetch { request, file_name: s(&f["filename"]) })
 }
 
 pub async fn search(ctx: &Ctx<'_>, query: &str) -> Result<Vec<SearchHit>, String> {

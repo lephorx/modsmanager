@@ -102,8 +102,6 @@ pub fn fetch(ctx: &Ctx<'_>, cur: &NewMod) -> Fetch {
     Fetch {
         request: ctx.http.get(format!("{BASE}/package/download/{ns}/{name}/{}/", cur.file_ref)),
         file_name: format!("{ns}-{name}-{}.zip", cur.file_ref),
-        md5: None,
-        sha256: None,
     }
 }
 

@@ -260,7 +260,7 @@ pub async fn fetch(ctx: &Ctx<'_>, cur: &NewMod) -> Result<Fetch, String> {
         .and_then(|u| u.path_segments()?.filter(|p| !p.is_empty()).last().map(|n| n.to_string()))
         .map(|n| percent_decode(&n))
         .unwrap_or_else(|| format!("nexus-{}.zip", cur.file_ref));
-    Ok(Fetch { request: ctx.http.get(uri), file_name, md5: None, sha256: None })
+    Ok(Fetch { request: ctx.http.get(uri), file_name })
 }
 
 fn percent_decode(s: &str) -> String {

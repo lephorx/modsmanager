@@ -39,8 +39,6 @@ pub struct Fetch {
     pub request: reqwest::RequestBuilder,
     /// Used when the server doesn't name the file.
     pub file_name: String,
-    pub md5: Option<String>,
-    pub sha256: Option<String>,
 }
 
 #[derive(Serialize)]

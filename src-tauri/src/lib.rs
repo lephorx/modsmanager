@@ -761,6 +761,9 @@ fn package_name(m: &NewMod) -> String {
     }
 }
 
+/// How often one file is downloaded before its job fails.
+const DOWNLOAD_TRIES: u32 = 4;
+
 /// Downloads and installs one mod; `progress(phase, done, total)` reports along the way.
 #[allow(clippy::too_many_arguments)]
 async fn install_one(
@@ -781,22 +784,45 @@ async fn install_one(
         return Err(format!("Set the {} mods folder first (Edit game)", game.data.name));
     }
     let ctx = state.ctx(settings, game);
-    let fetch = sources::fetch(&ctx, &m.data).await?;
+    let mut tries = 0;
+    let fetch = loop {
+        tries += 1;
+        match sources::fetch(&ctx, &m.data).await {
+            Err(e) if !e.starts_with(nexus::NEEDS_CLICK) && tries < DOWNLOAD_TRIES && !cancelled() => {
+                tokio::time::sleep(Duration::from_secs(3 * tries as u64)).await;
+            }
+            r => break r?,
+        }
+    };
     let file = state.temp.join(format!("dl-{}", m.id));
     let staging = state.temp.join(format!("unpack-{}", m.id));
     let mut last = Instant::now() - Duration::from_secs(1);
-    let got = install::download(
-        fetch,
-        &file,
-        |done, total| {
-            if last.elapsed() >= Duration::from_millis(150) || done == total {
-                last = Instant::now();
-                progress("downloading", done, total);
+    // Network hiccups, cut-off downloads and server errors are retried with a pause, so one bad
+    // moment doesn't fail the job. The link is fetched once (a Nexus key works only once).
+    let mut attempt = 0;
+    let got = loop {
+        attempt += 1;
+        let r = install::download(
+            &fetch,
+            &file,
+            |done, total| {
+                if last.elapsed() >= Duration::from_millis(150) || done == total {
+                    last = Instant::now();
+                    progress("downloading", done, total);
+                }
+            },
+            cancelled,
+        )
+        .await;
+        match r {
+            Err(e) if e != install::CANCELLED && attempt < DOWNLOAD_TRIES && !cancelled() => {
+                let _ = std::fs::remove_file(&file);
+                progress("downloading", 0, 0);
+                tokio::time::sleep(Duration::from_secs(3 * attempt as u64)).await;
             }
-        },
-        cancelled,
-    )
-    .await;
+            r => break r,
+        }
+    };
     let got = match got {
         Ok(g) => g,
         Err(e) => {
@@ -1788,7 +1814,7 @@ mod e2e {
         let fusion = sources::fetch(&ctx, &older).await.unwrap();
         let started = AtomicBool::new(false);
         let partial = ramon.temp.join("cancel-test");
-        let r = install::download(fusion, &partial, |_, _| started.store(true, Ordering::SeqCst), || started.load(Ordering::SeqCst)).await;
+        let r = install::download(&fusion, &partial, |_, _| started.store(true, Ordering::SeqCst), || started.load(Ordering::SeqCst)).await;
         assert_eq!(r.err().as_deref(), Some(install::CANCELLED), "stops after the first chunk");
         let _ = std::fs::remove_file(&partial);
         // …and cancelled jobs install nothing; the next sync queues them again

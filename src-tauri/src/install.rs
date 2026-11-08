@@ -9,7 +9,7 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use futures_util::StreamExt;
-use md5::{Digest as _, Md5};
+use sha2::Digest as _;
 use serde::Serialize;
 use sha2::Sha256;
 use tokio::io::AsyncWriteExt;
@@ -48,21 +48,23 @@ fn disposition_name(resp: &reqwest::Response) -> Option<String> {
 /// What a download stopped by `cancelled` returns.
 pub const CANCELLED: &str = "Cancelled";
 
-/// Streams the file to `dest`, reporting `(done, total)`, and checks it against the expected hash.
+/// Streams the file to `dest`, reporting `(done, total)`. A download shorter than the server
+/// announced, or a zip that isn't whole, is an error (worth retrying).
 /// Stops (with `CANCELLED`) as soon as `cancelled()` says so; the caller deletes the partial file.
-pub async fn download(fetch: Fetch, dest: &Path, mut progress: impl FnMut(u64, u64), cancelled: impl Fn() -> bool) -> Result<Downloaded, String> {
+pub async fn download(fetch: &Fetch, dest: &Path, mut progress: impl FnMut(u64, u64), cancelled: impl Fn() -> bool) -> Result<Downloaded, String> {
     if cancelled() {
         return Err(CANCELLED.into());
     }
-    let resp = fetch.request.send().await.map_err(|e| format!("Download failed: {}", e.without_url()))?;
+    let request = fetch.request.try_clone().ok_or("Can't repeat this download request")?;
+    let resp = request.send().await.map_err(|e| format!("Download failed: {}", e.without_url()))?;
     let resp = check(resp, "Download failed").await?;
     let total = resp.content_length().unwrap_or(0);
-    let file_name = disposition_name(&resp).unwrap_or(fetch.file_name);
+    let file_name = disposition_name(&resp).unwrap_or_else(|| fetch.file_name.clone());
     if let Some(dir) = dest.parent() {
         tokio::fs::create_dir_all(dir).await.map_err(|e| e.to_string())?;
     }
     let mut file = tokio::fs::File::create(dest).await.map_err(|e| e.to_string())?;
-    let (mut md5, mut sha) = (Md5::new(), Sha256::new());
+    let mut sha = Sha256::new();
     let mut done = 0u64;
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
@@ -70,7 +72,6 @@ pub async fn download(fetch: Fetch, dest: &Path, mut progress: impl FnMut(u64, u
             return Err(CANCELLED.into());
         }
         let chunk = chunk.map_err(|e| format!("Download interrupted: {}", e.without_url()))?;
-        md5.update(&chunk);
         sha.update(&chunk);
         file.write_all(&chunk).await.map_err(|e| e.to_string())?;
         done += chunk.len() as u64;
@@ -78,18 +79,17 @@ pub async fn download(fetch: Fetch, dest: &Path, mut progress: impl FnMut(u64, u
     }
     file.flush().await.map_err(|e| e.to_string())?;
     drop(file);
-    let md5 = hex::encode(md5.finalize());
+    if total > 0 && done < total {
+        return Err(format!("Download interrupted: got {} of {}", human_size(done), human_size(total)));
+    }
+    if is_zip(dest) && zip::ZipArchive::new(std::fs::File::open(dest).map_err(|e| e.to_string())?).is_err() {
+        return Err(format!("Download incomplete: the zip isn't whole ({} received)", human_size(done)));
+    }
+    // The source's own hash (mod.io md5, a link's pinned sha256) is not enforced: mod.io's stored
+    // hashes and sizes are sometimes off for files its servers have served unchanged for months,
+    // so a mismatch failed good downloads. The zip's own checksums (CRC32, checked while
+    // unpacking) catch real damage; the size check above catches cut-off downloads.
     let sha256 = hex::encode(sha.finalize());
-    if let Some(want) = fetch.md5 {
-        if !want.eq_ignore_ascii_case(&md5) {
-            return Err(format!("The server sent a different file than the one pinned on the list ({} downloaded, checksum differs). If a retry fails too, the file changed on the mod's page; pin another version.", human_size(done)));
-        }
-    }
-    if let Some(want) = fetch.sha256 {
-        if !want.eq_ignore_ascii_case(&sha256) {
-            return Err("The link now serves a different file than the one on the list. Use \"Update\" to pin the new one.".into());
-        }
-    }
     Ok(Downloaded { file_name, size: done, sha256 })
 }
 
