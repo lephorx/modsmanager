@@ -27,6 +27,9 @@ use tauri_plugin_deep_link::DeepLinkExt;
 
 type R<T> = Result<T, String>;
 
+/// When the shared database connection was last known to answer.
+static DB_CHECKED: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
 pub struct AppState {
     data_dir: PathBuf,
     temp: PathBuf,
@@ -58,8 +61,18 @@ impl AppState {
     async fn db(&self) -> R<Arc<Client>> {
         let client = {
             let mut slot = self.db.lock().await;
+            // A reused connection can be dead without knowing it: after a while unused, check it
+            // with a quick query and reconnect instead of letting the real query hang.
+            let stale = DB_CHECKED.lock().unwrap().is_none_or(|t| t.elapsed() > Duration::from_secs(15));
+            let alive = match slot.as_ref() {
+                Some(c) if !c.is_closed() => {
+                    !stale || matches!(tokio::time::timeout(Duration::from_secs(5), c.simple_query("SELECT 1")).await, Ok(Ok(_)))
+                }
+                _ => false,
+            };
+            *DB_CHECKED.lock().unwrap() = Some(std::time::Instant::now());
             match slot.as_ref() {
-                Some(c) if !c.is_closed() => c.clone(),
+                Some(c) if alive => c.clone(),
                 _ => {
                     let url = self.settings.read().await.database_url.clone();
                     if url.trim().is_empty() {

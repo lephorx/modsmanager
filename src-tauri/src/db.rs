@@ -224,7 +224,14 @@ fn tls() -> Result<postgres_native_tls::MakeTlsConnector, String> {
 type Connection = tokio_postgres::Connection<tokio_postgres::Socket, postgres_native_tls::TlsStream<tokio_postgres::Socket>>;
 
 async fn open(url: &str) -> Result<(Client, Connection), String> {
-    let config: tokio_postgres::Config = url.trim().parse().map_err(|_| "That isn't a valid database address (postgres://user:password@host:5432/db)".to_string())?;
+    let mut config: tokio_postgres::Config = url.trim().parse().map_err(|_| "That isn't a valid database address (postgres://user:password@host:5432/db)".to_string())?;
+    // A connection that died silently (sleep, network change, idle drop) otherwise looks open
+    // forever and every query on it hangs; keepalive probes turn that into an error in ~1 min.
+    config
+        .keepalives(true)
+        .keepalives_idle(std::time::Duration::from_secs(20))
+        .keepalives_interval(std::time::Duration::from_secs(5))
+        .keepalives_retries(4);
     let fut = config.connect(tls()?);
     match tokio::time::timeout(std::time::Duration::from_secs(10), fut).await {
         Ok(Ok(pair)) => Ok(pair),
