@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 
 const target = 'https://www.nexusmods.com/bonelab/mods/12?file_id=34&nmm=1';
 const source = readFileSync(new URL('../src-tauri/src/nexus_helper.js', import.meta.url), 'utf8');
-function run({ login = false, disabled = false, text = 'Slow download', offFile = false, blocked = false, consent = false, loggedOut = false, modernPath = false, signedIn = false, loginReturn = false, header = true, challenge = false } = {}) {
+function run({ login = false, disabled = false, text = 'Slow download', offFile = false, blocked = false, consent = false, loggedOut = false, modernPath = false, signedIn = false, loginReturn = false, header = true, challenge = false, shadow = false } = {}) {
   let clicks = 0;
   let tick;
   let timeout;
@@ -14,6 +14,15 @@ function run({ login = false, disabled = false, text = 'Slow download', offFile 
   let now = 0;
   const state = { blocked, consent, loggedOut, signedIn, header, challenge };
   const button = { textContent: text, disabled, getAttribute: () => null, getClientRects: () => [1], scrollIntoView() {}, getBoundingClientRect: () => ({ left: 0, top: 0, width: 100, height: 40 }), contains: () => false, click: () => clicks++ };
+  // Current Nexus pages render the button inside <mod-file-download>'s shadow root.
+  const host = { tagName: 'MOD-FILE-DOWNLOAD' };
+  if (shadow) {
+    host.shadowRoot = {
+      querySelectorAll: (selector) => selector === "button, a" ? [button] : [],
+      elementFromPoint: () => state.blocked ? {} : button,
+    };
+    button.getRootNode = () => host.shadowRoot;
+  }
   const location = {
     hostname: login ? 'users.nexusmods.com' : 'www.nexusmods.com',
     pathname: offFile ? '/' : modernPath ? '/games/bonelab/mods/12' : '/bonelab/mods/12', search: '?file_id=34',
@@ -30,9 +39,11 @@ function run({ login = false, disabled = false, text = 'Slow download', offFile 
         return state.challenge ? button : null;
       },
       querySelectorAll: (selector) => selector === "button, a"
-        ? [button, ...(state.loggedOut ? [{ ...button, textContent: "Log in" }] : [])]
+        ? [...(shadow ? [] : [button]), ...(state.loggedOut ? [{ ...button, textContent: "Log in" }] : [])]
+        : selector === "*" ? (shadow ? [host] : [])
         : state.consent ? [{ ...button, tagName: "IFRAME" }] : [],
-      elementFromPoint: () => state.blocked ? {} : button,
+      // document-level hit testing only sees the shadow host, never the button inside it
+      elementFromPoint: () => state.blocked ? {} : shadow ? host : button,
     },
     setInterval: (fn) => { tick = fn; }, setTimeout: (fn) => { timeout = fn; },
     clearInterval() {}, clearTimeout() {},
@@ -130,4 +141,19 @@ test('does not accept a challenge or an unrendered navigation as a login', () =>
     assert.ok(!page.messages.includes('signed-in'));
     assert.deepEqual(page.navigations, []);
   }
+});
+
+test('finds and clicks Slow download inside a web component shadow root', () => {
+  const page = run({ shadow: true });
+  page.tick();
+  assert.equal(page.clicks(), 1);
+  assert.deepEqual(page.messages, []);
+  assert.deepEqual(page.navigations, []);
+});
+test('does not click a shadow-root button covered by an overlay', () => {
+  const page = run({ shadow: true, blocked: true });
+  assert.equal(page.clicks(), 0);
+  assert.deepEqual(page.messages, ['show']);
+  page.state.blocked = false; page.tick();
+  assert.equal(page.clicks(), 1);
 });

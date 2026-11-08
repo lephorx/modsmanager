@@ -1292,6 +1292,9 @@ async fn nexus_browser_signal(app: AppHandle, action: &str) -> R<()> {
 /// Async on purpose: a window made from a synchronous command on Windows hangs, blank and white.
 #[tauri::command]
 async fn nexus_browse(app: AppHandle, url: String, name: Option<String>, show: Option<bool>) -> R<()> {
+    // Overlapping calls must not each find no window and build one: that opened two windows.
+    static OPENING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _one_at_a_time = OPENING.lock().await;
     let mut parsed: url::Url = url.parse().map_err(|_| "Not a web link")?;
     if parsed.scheme() != "https" || !parsed.host_str().is_some_and(|h| h == "nexusmods.com" || h.ends_with(".nexusmods.com")) {
         return Err("Not a Nexus Mods page".into());

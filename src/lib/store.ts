@@ -168,7 +168,15 @@ export function nexusPending() {
 let assisting: string | null = null;
 
 /** Opens the next Nexus file's page; the click there comes back as an nxm:// link. */
-export async function nextFromNexus(show = false) {
+let opening: Promise<void> | null = null;
+export function nextFromNexus(show = false): Promise<void> {
+  // One at a time: queueing the files below fires a queue event that asks for the next page
+  // too, and two overlapping calls used to open two Nexus windows.
+  opening ??= openNextNexus(show).finally(() => (opening = null));
+  return opening;
+}
+
+async function openNextNexus(show: boolean) {
   // make sure the Nexus files are in the queue, so their clicks have somewhere to go
   if (nexusPending().some((p) => !gameJobs().some((j) => j.key === p.key))) await runSync(true);
   const next = gameJobs().find((j) => j.status === "waiting" && j.manualUrl);

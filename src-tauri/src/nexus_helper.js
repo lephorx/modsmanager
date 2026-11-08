@@ -20,11 +20,21 @@
   const accessible = (el) => {
     el.scrollIntoView({ block: "center" });
     const rect = el.getBoundingClientRect();
-    const top = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+    // Inside a shadow tree, document.elementFromPoint only returns the host; ask the tree itself.
+    const root = el.getRootNode ? el.getRootNode() : document;
+    const at = typeof root.elementFromPoint === "function" ? root : document;
+    const top = at.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
     return top === el || el.contains(top);
   };
   const onHome = () => ["/", "/games", "/games/"].includes(location.pathname);
-  const controls = () => [...document.querySelectorAll("button, a")];
+  // Nexus renders the download buttons inside web components (e.g. <mod-file-download>),
+  // so search open shadow roots as well as the document.
+  const deepAll = (selector, root = document, out = []) => {
+    out.push(...root.querySelectorAll(selector));
+    for (const el of root.querySelectorAll("*")) if (el.shadowRoot) deepAll(selector, el.shadowRoot, out);
+    return out;
+  };
+  const controls = () => deepAll("button, a");
   const label = (el) => el.textContent.trim().replace(/\s+/g, " ").toLowerCase();
   const check = () => {
     // Never inject messages or redirects into Nexus's authentication pages.
@@ -62,8 +72,8 @@
     }
     if (onHome()) return; // Rust resumes the pending file after persisting login.
     if (clicked) return;
-    const button = [...document.querySelectorAll("button, a")].find((el) =>
-      el.textContent.trim().replace(/\s+/g, " ").toLowerCase() === "slow download" &&
+    const button = controls().find((el) =>
+      label(el) === "slow download" &&
       !el.disabled && el.getAttribute("aria-disabled") !== "true" && visible(el));
     if (!button) return;
     if (!accessible(button)) { show(); return; }
