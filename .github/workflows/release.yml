@@ -4,6 +4,11 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag to build and publish (blank for a build only)
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -11,21 +16,25 @@ permissions:
 jobs:
   windows:
     runs-on: windows-latest
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag || (github.ref_type == 'tag' && github.ref_name) || '' }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG || github.ref }}
       # a draft first: if GitHub refuses, this fails in seconds instead of after the build, and
       # installed apps keep seeing the previous release (with its latest.json) until this one is complete
       - name: Create the release (draft)
         id: release
-        if: github.ref_type == 'tag'
+        if: env.RELEASE_TAG != ''
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --draft --verify-tag --title "Mods Manager $GITHUB_REF_NAME" --notes-from-tag
-          id=$(gh release view "$GITHUB_REF_NAME" --json databaseId --jq .databaseId)
+          gh release view "$RELEASE_TAG" > /dev/null 2>&1 || gh release create "$RELEASE_TAG" --draft --verify-tag --title "Mods Manager $RELEASE_TAG" --notes-from-tag
+          id=$(gh release view "$RELEASE_TAG" --json databaseId --jq .databaseId)
           # without the id the build would skip every upload and publish an empty release
-          [ -n "$id" ] || { echo "Couldn't find the draft release for $GITHUB_REF_NAME"; exit 1; }
+          [ -n "$id" ] || { echo "Couldn't find the draft release for $RELEASE_TAG"; exit 1; }
           echo "id=$id" >> "$GITHUB_OUTPUT"
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
@@ -38,10 +47,13 @@ jobs:
           workspaces: src-tauri
           # reuse the release build's dependencies from the previous release
           shared-key: release
+          save-always: true
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       # tests already ran in CI on the push to main
       - uses: tauri-apps/tauri-action@v0
+        id: bundle
+        continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # signs the update; the app's updater refuses unsigned ones
@@ -50,23 +62,50 @@ jobs:
         with:
           releaseId: ${{ steps.release.outputs.id }}
           # with the tag, latest.json links to this version's files (not "the latest release's")
-          tagName: ${{ github.ref_name }}
+          tagName: ${{ env.RELEASE_TAG || github.ref_name }}
+          includeUpdaterJson: true
+      # Keep compiled binaries and downloaded tools when a packaging download fails.
+      - uses: tauri-apps/tauri-action@v0
+        id: bundle_retry
+        if: steps.bundle.outcome == 'failure'
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # signs the update; the app's updater refuses unsigned ones
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          releaseId: ${{ steps.release.outputs.id }}
+          # with the tag, latest.json links to this version's files (not "the latest release's")
+          tagName: ${{ env.RELEASE_TAG || github.ref_name }}
+          includeUpdaterJson: true
+      - uses: tauri-apps/tauri-action@v0
+        if: steps.bundle_retry.outcome == 'failure'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # signs the update; the app's updater refuses unsigned ones
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          releaseId: ${{ steps.release.outputs.id }}
+          # with the tag, latest.json links to this version's files (not "the latest release's")
+          tagName: ${{ env.RELEASE_TAG || github.ref_name }}
           includeUpdaterJson: true
       # everything is uploaded: now installed apps may see it
       - name: Publish the release
-        if: github.ref_type == 'tag'
+        if: env.RELEASE_TAG != ''
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          n=$(gh release view "$GITHUB_REF_NAME" --json assets --jq '[.assets[].name | select(endswith("latest.json") or endswith("-setup.exe") or endswith(".sig"))] | length')
+          n=$(gh release view "$RELEASE_TAG" --json assets --jq '[.assets[].name | select(endswith("latest.json") or endswith("-setup.exe") or endswith(".sig"))] | length')
           [ "$n" -ge 3 ] || { echo "Only $n of the installer, signature and latest.json are uploaded; not publishing"; exit 1; }
-          gh release edit "$GITHUB_REF_NAME" --draft=false --latest
+          gh release edit "$RELEASE_TAG" --draft=false --latest
       # the updater file must point at the published files (not a draft's temporary links)
       - name: Check the update file
-        if: github.ref_type == 'tag'
+        if: env.RELEASE_TAG != ''
         shell: bash
         run: |
-          json=$(curl -fsSL "https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/latest.json")
+          json=$(curl -fsSL "https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/latest.json")
           echo "$json"
-          echo "$json" | grep -q "/releases/download/$GITHUB_REF_NAME/" || { echo "latest.json doesn't point at $GITHUB_REF_NAME"; exit 1; }
+          echo "$json" | grep -q "/releases/download/$RELEASE_TAG/" || { echo "latest.json doesn't point at $RELEASE_TAG"; exit 1; }
