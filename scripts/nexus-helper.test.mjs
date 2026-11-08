@@ -5,12 +5,12 @@ import assert from 'node:assert/strict';
 
 const target = 'https://www.nexusmods.com/bonelab/mods/12?file_id=34&nmm=1';
 const script = readFileSync(new URL('../src-tauri/src/nexus_helper.js', import.meta.url), 'utf8').replace('__MM_INFO__', JSON.stringify({ url: target }));
-function run({ login = false, disabled = false, text = 'Slow download', offFile = false, blocked = false, consent = false, loggedOut = false, modernPath = false } = {}) {
+function run({ login = false, disabled = false, text = 'Slow download', offFile = false, blocked = false, consent = false, loggedOut = false, modernPath = false, signedIn = false } = {}) {
   let clicks = 0;
   let tick;
   let timeout;
   const navigations = [];
-  const state = { blocked, consent, loggedOut };
+  const state = { blocked, consent, loggedOut, signedIn };
   const button = { textContent: text, disabled, getAttribute: () => null, getClientRects: () => [1], scrollIntoView() {}, getBoundingClientRect: () => ({ left: 0, top: 0, width: 100, height: 40 }), contains: () => false, click: () => clicks++ };
   const location = {
     hostname: login ? 'users.nexusmods.com' : 'www.nexusmods.com',
@@ -20,7 +20,7 @@ function run({ login = false, disabled = false, text = 'Slow download', offFile 
   vm.runInNewContext(script, {
     URL, URLSearchParams, location, window: {}, getComputedStyle: () => ({ visibility: "visible" }),
     document: {
-      querySelector: () => null,
+      querySelector: (selector) => selector.includes("sign_out") && state.signedIn ? button : null,
       querySelectorAll: (selector) => selector === "button, a"
         ? [button, ...(state.loggedOut ? [{ ...button, textContent: "Log in" }] : [])]
         : state.consent ? [{ ...button, tagName: "IFRAME" }] : [],
@@ -54,12 +54,12 @@ test('reveals login once without clicking', () => {
   const page = run({ login: true });
   page.tick(); page.timeout();
   assert.equal(page.clicks(), 0);
-  assert.deepEqual(page.navigations, ['mm-nexus://show']);
+  assert.deepEqual(page.navigations, ['mm-nexus://show', 'mm-nexus://signed-out']);
 });
-test('returns to the requested file after login', () => {
+test('does not infer login from a homepage redirect', () => {
   const page = run({ offFile: true });
   assert.equal(page.clicks(), 0);
-  assert.deepEqual(page.navigations, [target]);
+  assert.deepEqual(page.navigations, []);
 });
 
 test('waits for cookie consent and resumes without consuming the download click', () => {
@@ -76,7 +76,7 @@ test('waits for cookie consent and resumes without consuming the download click'
 test('shows the logged-out file page and resumes after login', () => {
   const page = run({ loggedOut: true });
   assert.equal(page.clicks(), 0);
-  assert.deepEqual(page.navigations, ['mm-nexus://show']);
+  assert.deepEqual(page.navigations, ['mm-nexus://signed-out', 'mm-nexus://show']);
   page.state.loggedOut = false; page.tick();
   assert.equal(page.clicks(), 1);
 });
@@ -84,4 +84,11 @@ test('accepts the modern Nexus route without redirecting in a loop', () => {
   const page = run({ modernPath: true });
   assert.equal(page.clicks(), 1);
   assert.deepEqual(page.navigations, []);
+});
+
+test('reports a confirmed login once so the backend can save it and resume the file', () => {
+  const page = run({ offFile: true, signedIn: true });
+  page.tick(); page.tick();
+  assert.equal(page.clicks(), 0);
+  assert.deepEqual(page.navigations, ['mm-nexus://signed-in']);
 });

@@ -235,6 +235,9 @@ pub async fn latest(ctx: &Ctx<'_>, cur: &NewMod) -> Result<Option<NewMod>, Strin
 /// they clicked on the website (the `nxm://` key). Otherwise a `NEEDS_CLICK` error with the page.
 pub async fn fetch(ctx: &Ctx<'_>, cur: &NewMod) -> Result<Fetch, String> {
     let d = domain(ctx)?;
+    if !ctx.settings.nexus_logged_in {
+        return Err(format!("{NEEDS_CLICK}{}", file_page(&d, &cur.source_id, &cur.file_ref)));
+    }
     let slot = format!("{}:{}", cur.source_id, cur.file_ref);
     let now = chrono::Utc::now().timestamp();
     let key = ctx.nxm.lock().unwrap().get(&slot).filter(|k| k.expires > now).cloned();

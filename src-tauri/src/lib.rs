@@ -266,13 +266,17 @@ async fn get_settings(state: State<'_, AppState>) -> R<Settings> {
 }
 
 #[tauri::command]
-async fn save_settings(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> R<()> {
+async fn save_settings(app: AppHandle, state: State<'_, AppState>, mut settings: Settings) -> R<()> {
     let (url_changed, nexus_changed) = {
         let old = state.settings.read().await;
         (old.database_url != settings.database_url, old.nexus_api_key != settings.nexus_api_key || old.nexus_ignore_links != settings.nexus_ignore_links)
     };
-    config::save(&state.settings_path(), &settings)?;
-    *state.settings.write().await = settings;
+    {
+        let mut saved = state.settings.write().await;
+        settings.nexus_logged_in = saved.nexus_logged_in;
+        config::save(&state.settings_path(), &settings)?;
+        *saved = settings;
+    }
     if url_changed {
         *state.db.lock().await = None;
         start_listener(&app);
@@ -818,7 +822,7 @@ async fn enqueue(state: &AppState, game: i64) -> R<usize> {
     let mods = db::list_mods(&db, game).await?;
     let items = plan(&paths, &state.local.lock().await.game(game), &mods);
     let premium = if mods.iter().any(|m| m.data.source == "nexus") { state.nexus_account(false).await.is_some_and(|a| a.premium) } else { false };
-    let _ = settings;
+    let logged_in = settings.nexus_logged_in;
     let mut jobs = state.queue.jobs.lock().unwrap();
     let mut added = 0;
     for item in items {
@@ -829,7 +833,7 @@ async fn enqueue(state: &AppState, game: i64) -> R<usize> {
         let m = mods.iter().find(|m| Some(m.id) == item.id);
         let nexus = m.filter(|m| m.data.source == "nexus").map(|m| format!("{}:{}", m.data.source_id, m.data.file_ref));
         let has_key = nexus.as_ref().is_some_and(|k| state.nxm.lock().unwrap().contains_key(k));
-        let manual = nexus.is_some() && !premium && !has_key;
+        let manual = item.action != "remove" && nexus.is_some() && (!logged_in || (!premium && !has_key));
         jobs.push(Job {
             id: state.queue.next_id.fetch_add(1, Ordering::SeqCst) + 1,
             game,
@@ -1229,6 +1233,27 @@ fn open_url(app: AppHandle, url: String) -> R<()> {
 }
 
 const NEXUS_WINDOW: &str = "nexus";
+const NEXUS_SIGN_IN: &str = "https://users.nexusmods.com/auth/sign_in?redirect_url=https%3A%2F%2Fwww.nexusmods.com%2F";
+
+async fn set_nexus_login(app: &AppHandle, logged_in: bool) -> R<()> {
+    let state = app.state::<AppState>();
+    let mut settings = state.settings.write().await;
+    if settings.nexus_logged_in == logged_in { return Ok(()); }
+    settings.nexus_logged_in = logged_in;
+    config::save(&state.settings_path(), &*settings)?;
+    let _ = app.emit("nexus-login", logged_in);
+    Ok(())
+}
+
+#[tauri::command]
+async fn nexus_login(app: AppHandle) -> R<()> {
+    set_nexus_login(&app, false).await?;
+    let target = app.state::<AppState>().queue.jobs.lock().unwrap().iter()
+        .find(|j| j.status == "waiting" && j.manual_url.is_some())
+        .and_then(|j| j.manual_url.clone())
+        .unwrap_or_else(|| "https://www.nexusmods.com/".into());
+    nexus_browse(app, target, None, Some(true)).await
+}
 static NEXUS_TARGET: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 /// Loads a Nexus file in a hidden persistent browser, revealed for login or recovery. The
@@ -1237,7 +1262,7 @@ static NEXUS_TARGET: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(No
 /// Async on purpose: a window made from a synchronous command on Windows hangs, blank and white.
 #[tauri::command]
 async fn nexus_browse(app: AppHandle, url: String, name: Option<String>, show: Option<bool>) -> R<()> {
-    let parsed: url::Url = url.parse().map_err(|_| "Not a web link")?;
+    let mut parsed: url::Url = url.parse().map_err(|_| "Not a web link")?;
     if parsed.scheme() != "https" || !parsed.host_str().is_some_and(|h| h == "nexusmods.com" || h.ends_with(".nexusmods.com")) {
         return Err("Not a Nexus Mods page".into());
     }
@@ -1245,14 +1270,16 @@ async fn nexus_browse(app: AppHandle, url: String, name: Option<String>, show: O
         Some(n) if !n.trim().is_empty() => format!("Nexus Mods: {}", n.trim()),
         _ => "Nexus Mods".to_string(),
     };
-    *NEXUS_TARGET.lock().unwrap() = Some(url);
+    let needs_login = !app.state::<AppState>().settings.read().await.nexus_logged_in;
+    if needs_login { parsed = NEXUS_SIGN_IN.parse().unwrap(); }
+    let previous = NEXUS_TARGET.lock().unwrap().replace(url.clone());
     if let Some(w) = app.get_webview_window(NEXUS_WINDOW) {
-        if show.unwrap_or(false) {
+        if show.unwrap_or(false) && !needs_login && previous.as_deref() == Some(url.as_str()) {
             let _ = w.show();
             let _ = w.set_focus();
             return Ok(());
         }
-        let _ = w.hide();
+        if needs_login || show.unwrap_or(false) { let _ = w.show(); let _ = w.set_focus(); } else { let _ = w.hide(); }
         w.navigate(parsed).map_err(|e| e.to_string())?;
         let _ = w.set_title(&title);
         return Ok(());
@@ -1260,7 +1287,7 @@ async fn nexus_browse(app: AppHandle, url: String, name: Option<String>, show: O
     let handle = app.clone();
     let w = tauri::WebviewWindowBuilder::new(&app, NEXUS_WINDOW, tauri::WebviewUrl::External(parsed))
         .title(title)
-        .visible(show.unwrap_or(false))
+        .visible(needs_login || show.unwrap_or(false))
         .on_page_load(|w, payload| {
             if payload.event() != tauri::webview::PageLoadEvent::Finished { return; }
             if !payload.url().host_str().is_some_and(|h| h == "nexusmods.com" || h.ends_with(".nexusmods.com")) { return; }
@@ -1273,6 +1300,33 @@ async fn nexus_browse(app: AppHandle, url: String, name: Option<String>, show: O
         .min_inner_size(600.0, 500.0)
         .on_navigation(move |u| {
             if u.scheme() == "mm-nexus" {
+                if matches!(u.host_str(), Some("signed-in") | Some("signed-out")) {
+                    let app = handle.clone();
+                    let logged_in = u.host_str() == Some("signed-in");
+                    tauri::async_runtime::spawn(async move {
+                        if let Err(e) = set_nexus_login(&app, logged_in).await {
+                            let _ = app.emit("nexus-error", e);
+                            return;
+                        }
+                        if let Some(w) = app.get_webview_window(NEXUS_WINDOW) {
+                            if logged_in {
+                                let target = NEXUS_TARGET.lock().unwrap().clone();
+                                if let Some(target) = target {
+                                    if target == "https://www.nexusmods.com/" { let _ = w.hide(); }
+                                    else if w.url().ok().is_some_and(|u| u.path() == "/") {
+                                        if let Ok(url) = target.parse() { let _ = w.navigate(url); }
+                                    }
+                                }
+                            } else {
+                                let _ = w.show();
+                                if w.url().ok().is_some_and(|u| u.host_str() != Some("users.nexusmods.com")) {
+                                    let _ = w.navigate(NEXUS_SIGN_IN.parse().unwrap());
+                                }
+                            }
+                        }
+                    });
+                    return false;
+                }
                 if let Some(w) = handle.get_webview_window(NEXUS_WINDOW) {
                     match u.host_str() {
                         Some("show") => { let _ = w.show(); let _ = w.set_focus(); }
@@ -1450,6 +1504,7 @@ pub fn run() {
             open_url,
             nexus_browse,
             nexus_browse_close,
+            nexus_login,
             app_version,
         ])
         .run(tauri::generate_context!())

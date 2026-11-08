@@ -11,6 +11,7 @@ export interface Settings {
   modioApiKey: string;
   modioToken: string;
   nexusApiKey: string;
+  nexusLoggedIn: boolean;
   /** leave nxm:// links to another mod manager */
   nexusIgnoreLinks: boolean;
   autoSync: boolean;
@@ -220,6 +221,7 @@ export const api = {
   openUrl: (url: string) => invoke<void>("open_url", { url }),
   /** a Nexus page in Mods Manager's own window; its download clicks come back as "nexus-link" */
   nexusBrowse: (url: string, name?: string, show = false) => invoke<void>("nexus_browse", { url, name: name ?? null, show }),
+  nexusLogin: () => invoke<void>("nexus_login"),
   nexusBrowseClose: () => invoke<void>("nexus_browse_close"),
   version: () => invoke<string>("app_version"),
 };

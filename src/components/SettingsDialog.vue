@@ -55,6 +55,10 @@ const nexusError = ref("");
 const nxmLink = ref("");
 // bound, not inline: vue-tsc mis-parses the // in a static attribute
 const NXM_PLACEHOLDER = "nxm://…";
+async function loginNexus() {
+  try { await api.nexusLogin(); }
+  catch (e) { toast.error(errorText(e)); }
+}
 async function checkNexus() {
   nexusError.value = "";
   nexus.value = null;
@@ -266,6 +270,12 @@ function openFolder(which: "content" | "game") {
             </template>
 
             <template v-else-if="settingsDialog.section === 'nexus'">
+              <div class="set-block">
+                <h3 class="set-title">Website login</h3>
+                <p class="set-hint">{{ store.settings?.nexusLoggedIn ? 'Logged in. Nexus downloads use your saved browser session.' : 'Log in to Nexus Mods before downloading. Your login is remembered on this computer.' }}</p>
+                <button class="btn" @click="loginNexus">{{ store.settings?.nexusLoggedIn ? 'Log in again' : 'Log in to Nexus Mods' }}</button>
+                <p class="set-hint">The website login and API key are separate; the API key is still needed to find mods and download links.</p>
+              </div>
               <div class="set-block">
                 <h3 class="set-title">API key</h3>
                 <p class="set-hint">For Nexus Mods games. Find it on nexusmods.com → your avatar → Site preferences → API Keys (Personal API Key, at the bottom).</p>

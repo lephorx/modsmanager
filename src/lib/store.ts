@@ -210,6 +210,10 @@ let started = false;
 export async function startEvents() {
   if (started) return;
   started = true;
+  await listen<boolean>("nexus-login", (e) => {
+    if (store.settings) store.settings.nexusLoggedIn = e.payload;
+    if (e.payload) toast.success("Logged in to Nexus Mods");
+  });
   await listen<Job[]>("queue", (e) => onQueue(e.payload));
   onQueue(await api.queue().catch(() => []));
   await listen<boolean>("live", (e) => (store.live = e.payload));

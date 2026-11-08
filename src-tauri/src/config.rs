@@ -18,6 +18,8 @@ pub struct Settings {
     pub modio_token: String,
     /// Nexus Mods personal API key (nexusmods.com → Site preferences → API Keys).
     pub nexus_api_key: String,
+    /// Set only after the Nexus browser confirms a signed-in session.
+    pub nexus_logged_in: bool,
     /// Leave `nxm://` links ("Mod Manager Download") to another mod manager such as Vortex.
     pub nexus_ignore_links: bool,
     /// Run a sync on its own when someone changes the list.
