@@ -10,7 +10,9 @@
     reportedLogin = value;
     signal(value ? "signed-in" : "signed-out");
   };
-  const signal = (action) => { location.href = `mm-nexus://${action}`; };
+  let sequence = 0;
+  let settledSince = null;
+  const signal = (action) => { document.title = `__mm_nexus__:${action}:${++sequence}`; };
   const show = () => {
     if (!prompted) { prompted = true; signal("show"); }
   };
@@ -25,23 +27,39 @@
   const controls = () => [...document.querySelectorAll("button, a")];
   const label = (el) => el.textContent.trim().replace(/\s+/g, " ").toLowerCase();
   const check = () => {
-    if (location.hostname === "users.nexusmods.com" ||
-        document.querySelector('input[type="password"], #challenge-running, #challenge-stage')) {
+    // Never inject messages or redirects into Nexus's authentication pages.
+    if (location.hostname === "users.nexusmods.com") return;
+    if (document.querySelector('input[type="password"], #challenge-running, #challenge-stage')) {
+      settledSince = null;
       show();
-      if (location.hostname === "users.nexusmods.com") reportLogin(false);
       return;
     }
     // Consent can be in a cross-origin iframe. Leave the choice to the user and
     // resume when the overlay is gone; never consume the click behind a dialog.
     const consent = [...document.querySelectorAll('iframe[id^="sp_message_iframe"], [role="dialog"], [aria-modal="true"]')]
       .some((el) => visible(el) && (el.tagName === "IFRAME" || /consent|cookies/i.test(el.textContent)));
-    if (consent) { show(); return; }
+    if (consent) { settledSince = null; show(); return; }
     const login = controls().find((el) => label(el) === "log in" && visible(el));
-    if (login) { reportLogin(false); show(); return; }
+    if (login) {
+      // During hydration Nexus can briefly render a guest header even for a valid session.
+      settledSince = null;
+      if (!info.loginReturn) reportLogin(false);
+      show();
+      return;
+    }
     // Require positive account UI, never infer login merely from a missing button
     // while Nexus is still rendering. Header scope avoids mod-author profile links.
     const account = document.querySelector('a[href*="/sign_out"], a[href*="/logout"], header a[href*="/users/"], header [aria-label="User menu"], header [aria-label="Open user menu"], header [aria-label="Profile menu"]');
-    if (account && visible(account)) reportLogin(true);
+    const navigation = document.querySelector("header, nav");
+    const returnedFromLogin = info.loginReturn && document.readyState === "complete" &&
+      navigation && visible(navigation);
+    if (returnedFromLogin) settledSince ??= Date.now();
+    else settledSince = null;
+    // A known sign-in flow returned to the main site, whose rendered navigation
+    // stayed signed in for three seconds. Do not depend on a specific avatar label.
+    if ((account && visible(account)) || (settledSince !== null && Date.now() - settledSince >= 3000)) {
+      reportLogin(true);
+    }
     if (onHome()) return; // Rust resumes the pending file after persisting login.
     if (clicked) return;
     const button = [...document.querySelectorAll("button, a")].find((el) =>
@@ -57,7 +75,7 @@
   // Polling also notices disabled buttons becoming enabled, without depending on animation frames
   // (which are suspended by hidden webviews). Never repeat a click during the site's countdown.
   const timer = setInterval(check, 500);
-  const fallback = setTimeout(show, 45000);
+  const fallback = setTimeout(() => { if (location.hostname !== "users.nexusmods.com" && reportedLogin !== true) show(); }, 45000);
   window.__mmNexusCleanup = () => { clearInterval(timer); clearTimeout(fallback); };
   check();
 })();

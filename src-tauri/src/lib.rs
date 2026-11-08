@@ -1233,6 +1233,7 @@ fn open_url(app: AppHandle, url: String) -> R<()> {
 }
 
 const NEXUS_WINDOW: &str = "nexus";
+static NEXUS_LOGIN_PENDING: AtomicBool = AtomicBool::new(false);
 const NEXUS_SIGN_IN: &str = "https://users.nexusmods.com/auth/sign_in?redirect_url=https%3A%2F%2Fwww.nexusmods.com%2F";
 
 async fn set_nexus_login(app: &AppHandle, logged_in: bool) -> R<()> {
@@ -1256,6 +1257,35 @@ async fn nexus_login(app: AppHandle) -> R<()> {
 }
 static NEXUS_TARGET: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
+// A document-title message does not navigate away from a login form or interrupt a POST.
+async fn nexus_browser_signal(app: AppHandle, action: &str) -> R<()> {
+    let Some(w) = app.get_webview_window(NEXUS_WINDOW) else { return Ok(()); };
+    match action {
+        "show" => { let _ = w.show(); let _ = w.set_focus(); }
+        "signed-out" => {
+            set_nexus_login(&app, false).await?;
+            let _ = w.show();
+            if w.url().ok().is_some_and(|u| u.host_str() != Some("users.nexusmods.com")) {
+                NEXUS_LOGIN_PENDING.store(true, Ordering::Relaxed);
+                w.navigate(NEXUS_SIGN_IN.parse().unwrap()).map_err(|e| e.to_string())?;
+            }
+        }
+        "signed-in" => {
+            set_nexus_login(&app, true).await?;
+            NEXUS_LOGIN_PENDING.store(false, Ordering::Relaxed);
+            let target = NEXUS_TARGET.lock().unwrap().clone();
+            if let Some(target) = target {
+                if target == "https://www.nexusmods.com/" { let _ = w.hide(); }
+                else if w.url().ok().is_some_and(|u| matches!(u.path(), "/" | "/games" | "/games/")) {
+                    w.navigate(target.parse().map_err(|_| "Invalid Nexus file URL")?).map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Loads a Nexus file in a hidden persistent browser, revealed for login or recovery. The
 /// helper selects "Slow download"; its `nxm://` navigation is caught here instead of
 /// going through the browser and Windows. The window gets no access to the app's commands.
@@ -1271,7 +1301,10 @@ async fn nexus_browse(app: AppHandle, url: String, name: Option<String>, show: O
         _ => "Nexus Mods".to_string(),
     };
     let needs_login = !app.state::<AppState>().settings.read().await.nexus_logged_in;
-    if needs_login { parsed = NEXUS_SIGN_IN.parse().unwrap(); }
+    if needs_login {
+        NEXUS_LOGIN_PENDING.store(true, Ordering::Relaxed);
+        parsed = NEXUS_SIGN_IN.parse().unwrap();
+    }
     let previous = NEXUS_TARGET.lock().unwrap().replace(url.clone());
     if let Some(w) = app.get_webview_window(NEXUS_WINDOW) {
         if show.unwrap_or(false) && !needs_login && previous.as_deref() == Some(url.as_str()) {
@@ -1285,56 +1318,43 @@ async fn nexus_browse(app: AppHandle, url: String, name: Option<String>, show: O
         return Ok(());
     }
     let handle = app.clone();
+    let title_handle = app.clone();
     let w = tauri::WebviewWindowBuilder::new(&app, NEXUS_WINDOW, tauri::WebviewUrl::External(parsed))
         .title(title)
         .visible(needs_login || show.unwrap_or(false))
+        .on_document_title_changed(move |w, title| {
+            if !w.url().ok().is_some_and(|u| u.scheme() == "https" && matches!(u.host_str(), Some("www.nexusmods.com" | "nexusmods.com"))) { return; }
+            let Some(message) = title.strip_prefix("__mm_nexus__:") else { return; };
+            let action = message.split(':').next().unwrap_or("").to_string();
+            if !matches!(action.as_str(), "show" | "signed-in" | "signed-out") { return; }
+            let app = title_handle.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = nexus_browser_signal(app.clone(), &action).await {
+                    let _ = app.emit("nexus-error", e);
+                }
+            });
+        })
         .on_page_load(|w, payload| {
             if payload.event() != tauri::webview::PageLoadEvent::Finished { return; }
             if !payload.url().host_str().is_some_and(|h| h == "nexusmods.com" || h.ends_with(".nexusmods.com")) { return; }
+            if payload.url().host_str() == Some("users.nexusmods.com") {
+                // Leave login, two-factor authentication, and verification pages untouched.
+                let _ = w.show();
+                return;
+            }
             if let Some(target) = NEXUS_TARGET.lock().unwrap().as_ref() {
-                let script = include_str!("nexus_helper.js").replace("__MM_INFO__", &serde_json::json!({ "url": target }).to_string());
+                let script = include_str!("nexus_helper.js").replace("__MM_INFO__", &serde_json::json!({
+                    "url": target,
+                    "loginReturn": NEXUS_LOGIN_PENDING.load(Ordering::Relaxed)
+                }).to_string());
                 let _ = w.eval(&script);
             }
         })
         .inner_size(1100.0, 820.0)
         .min_inner_size(600.0, 500.0)
         .on_navigation(move |u| {
-            if u.scheme() == "mm-nexus" {
-                if matches!(u.host_str(), Some("signed-in") | Some("signed-out")) {
-                    let app = handle.clone();
-                    let logged_in = u.host_str() == Some("signed-in");
-                    tauri::async_runtime::spawn(async move {
-                        if let Err(e) = set_nexus_login(&app, logged_in).await {
-                            let _ = app.emit("nexus-error", e);
-                            return;
-                        }
-                        if let Some(w) = app.get_webview_window(NEXUS_WINDOW) {
-                            if logged_in {
-                                let target = NEXUS_TARGET.lock().unwrap().clone();
-                                if let Some(target) = target {
-                                    if target == "https://www.nexusmods.com/" { let _ = w.hide(); }
-                                    else if w.url().ok().is_some_and(|u| u.path() == "/") {
-                                        if let Ok(url) = target.parse() { let _ = w.navigate(url); }
-                                    }
-                                }
-                            } else {
-                                let _ = w.show();
-                                if w.url().ok().is_some_and(|u| u.host_str() != Some("users.nexusmods.com")) {
-                                    let _ = w.navigate(NEXUS_SIGN_IN.parse().unwrap());
-                                }
-                            }
-                        }
-                    });
-                    return false;
-                }
-                if let Some(w) = handle.get_webview_window(NEXUS_WINDOW) {
-                    match u.host_str() {
-                        Some("show") => { let _ = w.show(); let _ = w.set_focus(); }
-                        Some("hide") => { let _ = w.hide(); }
-                        _ => {}
-                    }
-                }
-                return false;
+            if u.host_str() == Some("users.nexusmods.com") && u.path().starts_with("/auth/sign_in") {
+                NEXUS_LOGIN_PENDING.store(true, Ordering::Relaxed);
             }
             if u.scheme() == "nxm" {
                 if let Some(w) = handle.get_webview_window(NEXUS_WINDOW) { let _ = w.hide(); }
