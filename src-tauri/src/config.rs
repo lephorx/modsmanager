@@ -70,6 +70,10 @@ pub struct Installed {
     pub root: Root,
     pub paths: Vec<String>,
     pub installed_at: chrono::DateTime<chrono::Utc>,
+    /// Every file inside `paths` when it was installed (relative to the root, `/`-separated), so
+    /// a folder with files missing counts as broken. Empty for installs from before this existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]

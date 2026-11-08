@@ -825,7 +825,8 @@ async fn install_one(
     let _ = std::fs::remove_file(&file);
     let _ = std::fs::remove_dir_all(&staging);
     let (root, placed) = placed?;
-    Ok(Installed { name: m.data.name.clone(), pin: m.data.pin(), version: m.data.version.clone(), root, paths: placed, installed_at: chrono::Utc::now() })
+    let files = install::manifest(&install::root_dir(&paths, root), &placed);
+    Ok(Installed { name: m.data.name.clone(), pin: m.data.pin(), version: m.data.version.clone(), root, paths: placed, installed_at: chrono::Utc::now(), files })
 }
 
 /// Adds what this computer has to do for a game to the queue; returns how many jobs were added.
@@ -1170,10 +1171,28 @@ async fn adopt(state: State<'_, AppState>, game: i64, mod_id: i64, keys: Vec<Str
             pin: if exact { m.data.pin() } else { "adopted|".into() },
             version: if exact { m.data.version.clone() } else { "unknown".into() },
             root,
+            files: install::manifest(&base, &rels),
             paths: rels,
             installed_at: chrono::Utc::now(),
         },
     );
+    state.save_local(&local).await
+}
+
+/// "Reinstall": the next sync takes this computer's copy of the mod out and installs the pinned
+/// file again, for files that are damaged in ways the presence check can't see.
+#[tauri::command]
+async fn reinstall(state: State<'_, AppState>, game: i64, mod_id: i64) -> R<()> {
+    let (db, _, _, _) = state.game(game).await?;
+    let m = db::get_mod(&db, mod_id).await?;
+    if m.game_id != game {
+        return Err("That mod belongs to another game".into());
+    }
+    let mut local = state.local.lock().await;
+    let Some(inst) = local.game_mut(game).installed.get_mut(&m.data.key()) else {
+        return Ok(()); // not installed here: a sync installs it anyway
+    };
+    inst.pin = "reinstall|".into();
     state.save_local(&local).await
 }
 
@@ -1532,6 +1551,7 @@ pub fn run() {
             unmanaged,
             delete_unmanaged,
             ignore_unmanaged,
+            reinstall,
             adopt,
             import_legacy,
             open_folder,

@@ -334,10 +334,40 @@ pub fn root_dir(paths: &GamePaths, root: Root) -> PathBuf {
     }
 }
 
-/// Every file or folder of the install is still there.
+/// Every file inside the installed paths (relative to `root`, `/`-separated): what `is_present`
+/// checks later. A path that is itself a file lists itself.
+pub fn manifest(root: &Path, paths: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for rel in paths {
+        let Some(p) = safe_join(root, rel) else { continue };
+        if p.is_dir() {
+            let mut files = Vec::new();
+            if walk(&p, root, &mut files).is_ok() {
+                out.extend(files.iter().map(|f| f.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/")));
+            }
+        } else if p.is_file() {
+            out.push(rel.clone());
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Every file or folder of the install is still there, and every file that was installed into
+/// them. Older installs without a file list at least need their folders to have something in them.
 pub fn is_present(paths: &GamePaths, inst: &Installed) -> bool {
     let root = root_dir(paths, inst.root);
-    !inst.paths.is_empty() && inst.paths.iter().all(|p| safe_join(&root, p).is_some_and(|p| p.exists()))
+    let there = |rel: &String| safe_join(&root, rel).is_some_and(|p| p.exists());
+    if inst.paths.is_empty() || !inst.paths.iter().all(there) {
+        return false;
+    }
+    if !inst.files.is_empty() {
+        return inst.files.iter().all(|f| safe_join(&root, f).is_some_and(|p| p.is_file()));
+    }
+    inst.paths.iter().all(|rel| {
+        let p = root.join(rel);
+        !p.is_dir() || std::fs::read_dir(&p).is_ok_and(|mut d| d.next().is_some())
+    })
 }
 
 /// Folders a loader owns: never deleted, even when a removal empties them.
@@ -478,7 +508,7 @@ mod tests {
     }
 
     fn installed(root: Root, paths: Vec<String>) -> Installed {
-        Installed { name: "x".into(), pin: String::new(), version: String::new(), root, paths, installed_at: chrono::Utc::now() }
+        Installed { name: "x".into(), pin: String::new(), version: String::new(), root, paths, installed_at: chrono::Utc::now(), files: Vec::new() }
     }
 
     #[test]
@@ -568,5 +598,30 @@ mod tests {
         assert!(safe_join(Path::new("C:/x"), "../evil").is_none());
         assert!(safe_join(Path::new("C:/x"), "").is_none());
         assert!(safe_join(Path::new("C:/x"), "Mods/a.dll").is_some());
+    }
+
+    #[test]
+    fn content_mod_with_a_missing_file_is_not_present() {
+        let mods = tmp("manifest");
+        write(&mods, "Author.Pallet/pallet.json");
+        write(&mods, "Author.Pallet/sub/level.bundle");
+        let paths = GamePaths { content_dir: mods.to_string_lossy().into(), ..Default::default() };
+        let mut inst = installed(Root::Content, vec!["Author.Pallet".into()]);
+        inst.files = manifest(&mods, &inst.paths);
+        assert_eq!(inst.files, vec!["Author.Pallet/pallet.json", "Author.Pallet/sub/level.bundle"]);
+        assert!(is_present(&paths, &inst));
+        std::fs::remove_file(mods.join("Author.Pallet/sub/level.bundle")).unwrap();
+        assert!(!is_present(&paths, &inst), "the folder is there, but a file of the mod isn't");
+    }
+
+    #[test]
+    fn older_install_with_an_empty_folder_is_not_present() {
+        let mods = tmp("empty-folder");
+        std::fs::create_dir_all(mods.join("Old.Mod")).unwrap();
+        let paths = GamePaths { content_dir: mods.to_string_lossy().into(), ..Default::default() };
+        let inst = installed(Root::Content, vec!["Old.Mod".into()]);
+        assert!(!is_present(&paths, &inst));
+        write(&mods, "Old.Mod/a.bundle");
+        assert!(is_present(&paths, &inst));
     }
 }

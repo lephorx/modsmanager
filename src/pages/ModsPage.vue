@@ -21,6 +21,7 @@ import {
   ListChecks,
   UserPlus,
   Link2,
+  RotateCcw,
 } from "lucide-vue-next";
 import { api, isActive, LOADER_LABEL, type Action, type Job, type ModView } from "@/lib/api";
 import { checkUpdates, currentGame, gameJobs, hasPaths, nextFromNexus, nexusPending, refresh, runSync, stopNexus, store } from "@/lib/store";
@@ -146,6 +147,17 @@ async function removeMod(m: ModView) {
   }
 }
 
+async function reinstall(m: ModView) {
+  try {
+    await api.reinstall(m.gameId, m.id);
+    toast.info(`Reinstalling ${m.name}…`);
+    await refresh();
+    await runSync(true);
+  } catch (e) {
+    toast.error(errorText(e));
+  }
+}
+
 function menu(m: ModView): RowMenuItem[] {
   const items: RowMenuItem[] = [];
   if (m.pageUrl) items.push({ label: m.source === "link" ? "Open link" : `Open on ${SOURCE_LABEL[m.source]}`, icon: ExternalLink, action: () => void api.openUrl(m.pageUrl) });
@@ -159,6 +171,7 @@ function menu(m: ModView): RowMenuItem[] {
     icon: FolderOpen,
     action: () => void api.openFolder(m.gameId, m.target === "code" && o.value?.game.loader !== "none" ? "game" : "content").catch((e) => toast.error(errorText(e))),
   });
+  if (m.state !== "missing") items.push({ label: "Reinstall", icon: RotateCcw, action: () => void reinstall(m) });
   if (m.state !== "installed") items.push({ label: "I already have this…", icon: Link2, action: () => (adopting.value = m) });
   items.push({ label: "Remove for everyone", icon: Trash2, danger: true, action: () => (confirmRemove.value = m) });
   return items;
