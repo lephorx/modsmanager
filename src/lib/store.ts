@@ -2,6 +2,7 @@ import { reactive } from "vue";
 import { listen } from "@tauri-apps/api/event";
 import { api, isActive, type GameView, type Job, type NewMod, type Overview, type Settings } from "./api";
 import { errorText, toast } from "./toast";
+import { openSettings } from "./settingsDialog";
 
 /** Everything the window shows, kept fresh by the backend's events. */
 export const store = reactive({
@@ -167,9 +168,19 @@ export function nexusPending() {
 /** The Nexus job currently being prepared in the browser. */
 let assisting: string | null = null;
 
+/** Not logged in to the Nexus website: send the user to Settings to log in, and start nothing. */
+export function needsNexusLogin(): boolean {
+  if (store.settings?.nexusLoggedIn) return false;
+  stopNexus();
+  openSettings("nexus");
+  toast.info("Log in to Nexus Mods first, then start the download again");
+  return true;
+}
+
 /** Opens the next Nexus file's page; the click there comes back as an nxm:// link. */
 let opening: Promise<void> | null = null;
 export function nextFromNexus(show = false): Promise<void> {
+  if (needsNexusLogin()) return Promise.resolve();
   // One at a time: queueing the files below fires a queue event that asks for the next page
   // too, and two overlapping calls used to open two Nexus windows.
   opening ??= openNextNexus(show).finally(() => (opening = null));
@@ -198,7 +209,8 @@ async function openNextNexus(show: boolean) {
 /** As soon as the clicked file is queued (its download runs in the background), show the next page. */
 let advancing = false;
 function followNexus() {
-  if (advancing) return;
+  // Not logged in: wait for an explicit click (which routes to Settings), never pop it up unasked.
+  if (advancing || !store.settings?.nexusLoggedIn) return;
   const j = gameJobs().find((x) => x.key === assisting);
   if (j && j.status === "waiting") return;
   advancing = true;

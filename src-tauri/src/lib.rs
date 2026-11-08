@@ -1249,11 +1249,9 @@ async fn set_nexus_login(app: &AppHandle, logged_in: bool) -> R<()> {
 #[tauri::command]
 async fn nexus_login(app: AppHandle) -> R<()> {
     set_nexus_login(&app, false).await?;
-    let target = app.state::<AppState>().queue.jobs.lock().unwrap().iter()
-        .find(|j| j.status == "waiting" && j.manual_url.is_some())
-        .and_then(|j| j.manual_url.clone())
-        .unwrap_or_else(|| "https://www.nexusmods.com/".into());
-    nexus_browse(app, target, None, Some(true)).await
+    // Only sign in: the homepage target hides the window once the login is confirmed, and no
+    // download starts until the user clicks "Get from Nexus" again.
+    nexus_browse(app, "https://www.nexusmods.com/".into(), None, Some(true)).await
 }
 static NEXUS_TARGET: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 

@@ -252,7 +252,7 @@ function added(m: ModView) {
           <ExternalLink />
           <span class="stack" style="gap: 2px; flex: 1; min-width: 0">
             <strong>{{ count(manual.length, "mod") }} from Nexus Mods {{ manual.length === 1 ? "needs" : "need" }} a browser session</strong>
-            <span class="hint">Mods Manager selects Slow download automatically in the background. You only need to log in when Nexus asks.</span>
+            <span class="hint">{{ store.settings?.nexusLoggedIn ? "Mods Manager selects Slow download automatically in the background." : "Log in to Nexus Mods in Settings first; then Mods Manager selects Slow download automatically." }}</span>
           </span>
           <button v-if="automatic.length" class="btn" @click="nextFromNexus()">Get {{ manual.length }} from Nexus</button>
         </template>

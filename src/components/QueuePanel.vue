@@ -2,7 +2,7 @@
 import { computed, ref } from "vue";
 import { ArrowUpToLine, Ban, ChevronDown, ChevronUp, CircleCheck, CircleStop, Clock, Download, ExternalLink, GripVertical, Loader2, OctagonX, RotateCw, Trash2, X } from "lucide-vue-next";
 import { api, isActive, type Job } from "@/lib/api";
-import { store } from "@/lib/store";
+import { needsNexusLogin, store } from "@/lib/store";
 import { bytes } from "@/lib/format";
 import { errorText, toast } from "@/lib/toast";
 
@@ -28,7 +28,7 @@ function detail(j: Job) {
   if (j.status === "downloading") return j.total ? `${bytes(j.done)} of ${bytes(j.total)}` : bytes(j.done) || "Starting…";
   if (j.status === "installing") return "Installing…";
   if (j.status === "removing") return "Removing…";
-  if (j.status === "waiting") return "Preparing download; log in if Nexus asks";
+  if (j.status === "waiting") return store.settings?.nexusLoggedIn ? "Preparing download" : "Log in to Nexus Mods in Settings first";
   if (j.status === "failed") return j.error ?? "Failed";
   if (j.status === "cancelled") return "Cancelled; Sync now gets it again";
   if (j.status === "done") return j.action === "remove" ? "Removed" : "Installed";
@@ -167,7 +167,7 @@ async function run(f: () => Promise<unknown>) {
                   <ChevronDown />
                 </button>
               </span>
-              <button v-if="j.status === 'waiting' && j.manualUrl" class="btn btn-sm" @click="run(() => api.nexusBrowse(j.manualUrl!, j.name, true))"><ExternalLink /> Open</button>
+              <button v-if="j.status === 'waiting' && j.manualUrl" class="btn btn-sm" @click="needsNexusLogin() || run(() => api.nexusBrowse(j.manualUrl!, j.name, true))"><ExternalLink /> Open</button>
               <button v-if="j.status === 'failed'" class="btn btn-sm" @click="run(() => api.queueRetry(j.id))"><RotateCw /> Retry</button>
               <button v-if="j.status === 'cancelled'" class="btn btn-sm" @click="run(() => api.queueRetry(j.id))"><RotateCw /> Start again</button>
               <button
