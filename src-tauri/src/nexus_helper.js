@@ -8,9 +8,16 @@
   const show = () => {
     if (!prompted) { prompted = true; signal("show"); }
   };
-  const target = new URL(info.url);
-  const onFile = () => location.pathname === target.pathname &&
-    new URLSearchParams(location.search).get("file_id") === target.searchParams.get("file_id");
+  const visible = (el) => el.getClientRects().length && getComputedStyle(el).visibility !== "hidden";
+  const accessible = (el) => {
+    el.scrollIntoView({ block: "center" });
+    const rect = el.getBoundingClientRect();
+    const top = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+    return top === el || el.contains(top);
+  };
+  const onHome = () => ["/", "/games", "/games/"].includes(location.pathname);
+  const controls = () => [...document.querySelectorAll("button, a")];
+  const label = (el) => el.textContent.trim().replace(/\s+/g, " ").toLowerCase();
   const check = () => {
     if (location.hostname === "users.nexusmods.com" ||
         document.querySelector('input[type="password"], #challenge-running, #challenge-stage')) {
@@ -18,14 +25,23 @@
       return;
     }
     // Nexus may return to the homepage after login.
-    if (!onFile()) { location.replace(info.url); return; }
+    if (onHome()) { location.replace(info.url); return; }
+    // Consent can be in a cross-origin iframe. Leave the choice to the user and
+    // resume when the overlay is gone; never consume the click behind a dialog.
+    const consent = [...document.querySelectorAll('iframe[id^="sp_message_iframe"], [role="dialog"], [aria-modal="true"]')]
+      .some((el) => visible(el) && (el.tagName === "IFRAME" || /consent|cookies/i.test(el.textContent)));
+    if (consent) { show(); return; }
+    const login = controls().find((el) => label(el) === "log in" && visible(el));
+    if (login) { show(); return; }
     if (clicked) return;
     const button = [...document.querySelectorAll("button, a")].find((el) =>
       el.textContent.trim().replace(/\s+/g, " ").toLowerCase() === "slow download" &&
-      !el.disabled && el.getAttribute("aria-disabled") !== "true" && el.getClientRects().length);
+      !el.disabled && el.getAttribute("aria-disabled") !== "true" && visible(el));
     if (!button) return;
+    if (!accessible(button)) { show(); return; }
     clicked = true;
-    signal("hide");
+    // Do not navigate to a visibility signal before clicking: that can interrupt
+    // the site's click handler. Rust hides the window when it receives the nxm link.
     button.click();
   };
   // Polling also notices disabled buttons becoming enabled, without depending on animation frames

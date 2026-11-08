@@ -1283,6 +1283,7 @@ async fn nexus_browse(app: AppHandle, url: String, name: Option<String>, show: O
                 return false;
             }
             if u.scheme() == "nxm" {
+                if let Some(w) = handle.get_webview_window(NEXUS_WINDOW) { let _ = w.hide(); }
                 let (app, link) = (handle.clone(), u.to_string());
                 tauri::async_runtime::spawn(async move {
                     if let Err(e) = handle_nxm(&app, &link) {
