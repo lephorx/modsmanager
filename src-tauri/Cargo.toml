@@ -1,6 +1,6 @@
 [package]
 name = "mods-manager"
-version = "0.7.4"
+version = "0.7.5"
 description = "Keeps everyone's mods identical, for any game"
 edition = "2021"
 
